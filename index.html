@@ -355,7 +355,7 @@ select {
         }
 
         const dateStr = new Date().toISOString().replace(/T/, '_').replace(/\..+/, '').replace(/:/g, '-');
-        doc.save(`MTG_Astro_Proxies_${dateStr}.pdf`);
+        doc.save(`MTG_Proxy_Wizard_${dateStr}.pdf`);
         btn.disabled = false;
         status.style.display = "none";
     }
@@ -378,3 +378,4 @@ select {
 
 </body>
 </html>
+
