@@ -26,7 +26,7 @@
         .controls-container { max-width: 1100px; margin: 1.5rem auto; padding: 0 1rem; display: grid; grid-template-columns: 1.5fr 1fr; gap: 1.5rem; }
         .box { background: var(--card-bg); border: 1px solid var(--border); border-radius: 1rem; padding: 1.5rem; display: flex; flex-direction: column; gap: 1rem; }
         
-        textarea { width: 100%; height: 120px; background: var(--input-bg); border: 1px solid var(--border); border-radius: 0.6rem; color: var(--text); padding: 0.8rem; font-family: monospace; resize: none; box-sizing: border-box; outline: none; font-size: 0.8rem; }
+        textarea { width: 100%; height: 140px; background: var(--input-bg); border: 1px solid var(--border); border-radius: 0.6rem; color: var(--text); padding: 0.8rem; font-family: monospace; resize: vertical; box-sizing: border-box; outline: none; font-size: 0.8rem; }
         input[type="text"] { width: 100%; padding: 0.8rem; background: var(--input-bg); border: 1px solid var(--border); border-radius: 0.6rem; color: var(--text); box-sizing: border-box; outline: none; }
         
         .btn { padding: 0.8rem; border-radius: 0.6rem; font-weight: 700; cursor: pointer; border: none; transition: 0.2s; font-size: 0.8rem; }
@@ -34,7 +34,7 @@
         .btn-accent { background: var(--accent-gradient); color: white; }
         
         .card-grid { max-width: 1200px; margin: 0 auto; padding: 1rem; display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 1.5rem; }
-        .card-item { background: var(--card-bg); border: 1px solid var(--border); border-radius: 0.8rem; padding: 0.6rem; text-align: center; box-shadow: 0 4px 15px rgba(0,0,0,0.2); transition: 0.2s; }
+        .card-item { background: var(--card-bg); border: 1px solid var(--border); border-radius: 0.8rem; padding: 0.6rem; text-align: center; box-shadow: 0 4px 15px rgba(0,0,0,0.2); }
         .card-item img { width: 100%; border-radius: 0.5rem; margin-bottom: 0.6rem; background: #222; min-height: 230px; }
         
         .card-actions { display: flex; gap: 0.4rem; justify-content: center; }
@@ -65,12 +65,12 @@
 
 <div class="controls-container">
     <div class="box">
-        <label style="font-size: 0.7rem; color: var(--text-muted);">LISTE ODER SCRYFALL-LINK</label>
+        <label style="font-size: 0.7rem; color: var(--text-muted);">DECKLISTE ODER SCRYFALL-LINKS</label>
         <textarea id="listInput" placeholder="4 Sol Ring&#10;1 https://scryfall.com/card/mh2/261/urzas-saga"></textarea>
         <button class="btn btn-primary" onclick="loadCards()">Liste laden</button>
     </div>
     <div class="box">
-        <input type="text" id="fileNameInput" placeholder="Dateiname">
+        <input type="text" id="fileNameInput" placeholder="Dateiname (Optional)">
         <select id="pageSize" style="padding: 0.8rem; border-radius: 0.6rem; background: var(--input-bg); color: var(--text); border: 1px solid var(--border);">
             <option value="5x7">Foto Papier (5x7")</option>
             <option value="a4">Standard A4</option>
@@ -95,8 +95,15 @@
 <script>
     let cardData = [];
     let currentEditIndex = null;
-    // Laden der gespeicherten Präferenzen
     let preferredArts = JSON.parse(localStorage.getItem('mtg_preferred_arts') || '{}');
+
+    // On Load: Deckliste wiederherstellen
+    window.onload = () => {
+        const savedList = localStorage.getItem('mtg_last_decklist');
+        if (savedList) {
+            document.getElementById('listInput').value = savedList;
+        }
+    };
 
     function toggleTheme() {
         const h = document.documentElement;
@@ -111,7 +118,6 @@
 
     async function resolveInput(input) {
         input = input.trim();
-        // Scryfall Link Check
         if (input.includes('scryfall.com/card/')) {
             try {
                 const parts = input.split('/card/')[1].split('/');
@@ -119,7 +125,6 @@
                 return await res.json();
             } catch (e) { return null; }
         }
-        // Standard Fuzzy/Token Search
         try {
             let url = `https://api.scryfall.com/cards/named?fuzzy=${encodeURIComponent(input)}`;
             if (input.toLowerCase().includes('token')) {
@@ -134,6 +139,9 @@
 
     async function loadCards() {
         const input = document.getElementById('listInput').value;
+        // Liste im localStorage speichern
+        localStorage.setItem('mtg_last_decklist', input);
+        
         const grid = document.getElementById('cardGrid');
         grid.innerHTML = '<p>Lade Karten...</p>';
         cardData = [];
@@ -145,7 +153,6 @@
             if (match) { count = parseInt(match[1]); content = match[2]; }
 
             let data = null;
-            // Prüfen, ob für diesen Namen/Link bereits ein spezieller Style gespeichert ist
             if (preferredArts[content]) {
                 const res = await fetch(`https://api.scryfall.com/cards/${preferredArts[content]}`);
                 data = await res.json();
@@ -171,7 +178,7 @@
 
     function renderPreview() {
         const grid = document.getElementById('cardGrid');
-        grid.innerHTML = cardData.length ? '' : '<p>Keine Karten gefunden.</p>';
+        grid.innerHTML = cardData.length ? '' : '<p>Keine Karten in der Vorschau.</p>';
         cardData.forEach((card, i) => {
             const div = document.createElement('div');
             div.className = 'card-item';
@@ -188,7 +195,6 @@
     }
 
     function duplicateCard(i) {
-        // Deep Copy der Karte inklusive des aktuellen Image-Pfads
         const newCard = JSON.parse(JSON.stringify(cardData[i]));
         cardData.splice(i + 1, 0, newCard);
         renderPreview();
@@ -206,7 +212,7 @@
         const artGrid = document.getElementById('artSelectionGrid');
         document.getElementById('modalTitle').innerText = card.name;
         modal.style.display = "block";
-        artGrid.innerHTML = "Suche Bilder...";
+        artGrid.innerHTML = "Lade Varianten...";
 
         try {
             const q = card.isToken ? `!"${card.name}" is:token` : `!"${card.name}" unique:prints`;
@@ -230,7 +236,6 @@
     function selectArt(url, id, originalName) {
         cardData[currentEditIndex].image = url;
         cardData[currentEditIndex].id = id;
-        // Speichern für diesen speziellen Slot/Namen
         preferredArts[originalName] = id;
         localStorage.setItem('mtg_preferred_arts', JSON.stringify(preferredArts));
         document.getElementById(`main-img-${currentEditIndex}`).src = url;
@@ -256,6 +261,7 @@
         if (cardData.length === 0) return;
         const status = document.getElementById('status-bar');
         status.style.display = "block";
+        
         const { jsPDF } = window.jspdf;
         const format = document.getElementById('pageSize').value;
         const is5x7 = format === '5x7';
@@ -263,7 +269,7 @@
         const w = 2.5, h = 3.5, perPage = is5x7 ? 4 : 9, cols = is5x7 ? 2 : 3;
 
         for (let i = 0; i < cardData.length; i++) {
-            status.innerText = `PDF: ${i+1}/${cardData.length}`;
+            status.innerText = `PDF wird erstellt: ${i+1}/${cardData.length}`;
             if (i > 0 && i % perPage === 0) doc.addPage();
             const pIdx = i % perPage;
             const x = (is5x7 ? 0 : 0.44) + (pIdx % cols) * w;
@@ -271,7 +277,15 @@
             const imgData = await getBase64(cardData[i].image);
             doc.addImage(imgData, 'JPEG', x, y, w, h, undefined, 'FAST');
         }
-        doc.save(`${document.getElementById('fileNameInput').value || 'Proxies'}.pdf`);
+
+        // Timestamp Generierung (YYMMDD_HHMM)
+        const now = new Date();
+        const ts = now.toISOString().slice(2,10).replace(/-/g, '') + "_" + 
+                   now.getHours().toString().padStart(2, '0') + 
+                   now.getMinutes().toString().padStart(2, '0');
+        
+        const userTitle = document.getElementById('fileNameInput').value.trim() || 'Proxies';
+        doc.save(`${ts}_${userTitle}.pdf`);
         status.style.display = "none";
     }
 
