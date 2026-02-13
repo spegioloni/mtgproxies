@@ -262,20 +262,22 @@ select {
     let cardData = [];
 
     function toggleTheme() {
-        const html = document.documentElement;
-        const icon = document.getElementById('theme-icon');
-        const btn = document.querySelector('.theme-toggle');
-        
-        if (html.getAttribute('data-theme') === 'dark') {
-            html.setAttribute('data-theme', 'light');
-            icon.innerText = '☀️';
-            btn.innerHTML = '☀️ Light Mode';
-        } else {
-            html.setAttribute('data-theme', 'dark');
-            icon.innerText = '🌙';
-            btn.innerHTML = '🌙 Dark Mode';
-        }
+    const html = document.documentElement;
+    const icon = document.getElementById('theme-icon');
+    const btn = document.querySelector('.theme-toggle');
+    
+    if (html.getAttribute('data-theme') === 'dark') {
+        html.setAttribute('data-theme', 'light');
+        // Wir aktualisieren nur das Icon und den Text separat, 
+        // ohne die ID im HTML zu löschen.
+        if (icon) icon.innerText = '☀️';
+        btn.childNodes[2].nodeValue = ' Light Mode'; 
+    } else {
+        html.setAttribute('data-theme', 'dark');
+        if (icon) icon.innerText = '🌙';
+        btn.childNodes[2].nodeValue = ' Dark Mode';
     }
+}
 
     async function loadCards() {
         const input = document.getElementById('listInput').value;
@@ -389,5 +391,6 @@ select {
 
 </body>
 </html>
+
 
 
