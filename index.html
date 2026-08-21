@@ -83,6 +83,10 @@
             <option value="5x7">Foto Papier (5x7")</option>
             <option value="a4">Standard A4</option>
         </select>
+        <select id="quality" style="padding: 0.8rem; border-radius: 0.6rem; background: var(--input-bg); color: var(--text); border: 1px solid var(--border);">
+            <option value="jpeg95">Hohe Qualität (JPEG 95%, kleine Datei)</option>
+            <option value="lossless">Maximale Qualität (verlustfrei, sehr groß)</option>
+        </select>
         <button id="dlBtn" class="btn btn-accent" onclick="generatePDF()">PDF Generieren</button>
     </div>
 </div>
@@ -155,6 +159,10 @@
 
     const memCache = new Map();
     const inFlight = new Map();
+    // Marker für "existiert nicht" - verhindert, dass erfolglose Suchen
+    // (z.B. Karte ohne deutschen Druck) bei jedem Umschalten neu abgefragt werden.
+    const NOT_FOUND = { __notFound: true };
+    let rateLimitHits = 0;
 
     function cacheKey(url, body) { return body ? url + '|' + body : url; }
 
@@ -193,7 +201,7 @@
     function scryfallFetch(url, { body = null, gap = API_GAP, retries = 3 } = {}) {
         const key = cacheKey(url, body);
         const hit = cacheGet(key);
-        if (hit) return Promise.resolve(hit);
+        if (hit) return Promise.resolve(hit.__notFound ? null : hit);
         // Identische Anfrage läuft bereits -> anhängen statt doppelt abfragen
         if (inFlight.has(key)) return inFlight.get(key);
 
@@ -211,18 +219,26 @@
                     }
                     const res = await fetch(url, opts);
                     if (res.status === 429) throw new Error('rate_limited');
-                    if (res.status === 404) return null;   // Karte existiert nicht
+                    if (res.status === 404) { cacheSet(key, NOT_FOUND); return null; }
                     if (!res.ok && res.status >= 500) throw new Error('server_' + res.status);
                     const json = await res.json();
                     if (json.object === 'error' && json.status === 429) throw new Error('rate_limited');
+                    if (json.object === 'error') { cacheSet(key, NOT_FOUND); return null; }
                     cacheSet(key, json);
                     return json;
                 } catch (e) {
+                    const limited = e.message === 'rate_limited';
+                    if (limited) rateLimitHits++;
                     if (attempt >= retries) return null;
-                    // 429 sperrt laut Scryfall 30s -> deutlich zurückfahren
-                    const backoff = e.message === 'rate_limited' ? 5000 * (attempt + 1) : 700 * (attempt + 1);
-                    setLoadStatus(`Scryfall-Limit erreicht, warte ${Math.round(backoff / 1000)}s...`);
-                    await sleep(backoff);
+                    // Ein 429 sperrt laut Scryfall den Zugriff fuer 30 Sekunden.
+                    // Kuerzer zu warten verlaengert die Sperre nur.
+                    const backoff = limited ? 31000 : 700 * (attempt + 1);
+                    for (let s = Math.ceil(backoff / 1000); s > 0; s--) {
+                        setLoadStatus(limited
+                            ? `Scryfall-Limit erreicht - warte ${s}s (Sperre dauert 30s)...`
+                            : `Netzwerkfehler - neuer Versuch in ${s}s...`);
+                        await sleep(1000);
+                    }
                 }
             }
         };
@@ -239,18 +255,96 @@
         if (p) p.innerText = text;
     }
 
-    // Versucht, eine Karte (per set/collector_number) in der gewünschten Sprache zu laden.
-    // Fällt bei fehlender Übersetzung auf die Originalkarte zurück.
-    // Sucht über ALLE Editionen der Karte (nicht nur den zuletzt gefundenen Druck),
-    // da nicht jeder Druck (z.B. Secret Lair/Sonderdrucke) in jeder Sprache existiert.
-    async function localize(data, lang) {
-        if (!data || data.lang === lang || !data.name) return data;
-        const isToken = data.layout === 'token';
-        const q = `!"${data.name}" lang:${lang}${isToken ? ' is:token' : ''}`;
-        const j = await scryfallFetch(`https://api.scryfall.com/cards/search?q=${encodeURIComponent(q)}&order=released&dir=desc`);
-        const t = j && j.data && j.data[0];
-        if (t && (t.image_uris || t.card_faces)) return t;
-        return data; // keine Übersetzung gefunden -> Original behalten
+    // Führt eine gebündelte ODER-Suche aus und trägt die Treffer in `found` ein.
+    // Schlägt die Anfrage fehl (z.B. wegen eines unerwartet abgelehnten Queries),
+    // wird der Block halbiert und erneut versucht - bis hinunter zur Einzelsuche.
+    // So kostet ein Fehlschlag nur wenige Zusatzanfragen statt 50.
+    async function runQuery(chunk, prefix, found, lang) {
+        const names = chunk.map(g => g.name.replace(/"/g, ''));
+        const q = `${prefix}${names.map(n => `!"${n}"`).join(' or ')})`;
+        let url = `https://api.scryfall.com/cards/search?q=${encodeURIComponent(q)}&order=released&dir=desc`;
+
+        let any = false, guard = 0;
+        while (url && guard++ < 15) {
+            const res = await scryfallFetch(url);
+            if (!res || !res.data) break;
+            any = true;
+            for (const card of res.data) {
+                // Exakter Namensabgleich: die ODER-Suche liefert z.B. auch
+                // Split-Karten wie "Emeritus of Conflict // Lightning Bolt"
+                if (!found.has(card.name) && names.includes(card.name) &&
+                    (card.image_uris || card.card_faces)) {
+                    found.set(card.name, card);
+                }
+            }
+            url = res.has_more ? res.next_page : null;
+        }
+
+        // Kein einziges Ergebnis bei mehreren Namen -> Query wurde abgelehnt.
+        // (Bei einem einzelnen Namen heisst es schlicht: keine Übersetzung.)
+        if (!any && chunk.length > 1) {
+            const mid = Math.ceil(chunk.length / 2);
+            await runQuery(chunk.slice(0, mid), prefix, found, lang);
+            await runQuery(chunk.slice(mid), prefix, found, lang);
+        }
+    }
+
+    // Übersetzt viele Karten mit möglichst wenigen Requests.
+    // Statt einer Suche pro Karte (was bei einem Commander-Deck ~100 Requests
+    // bedeutet und zwangsläufig ins Rate-Limit läuft) werden bis zu 50 Namen
+    // in einer einzigen ODER-Suche gebündelt:
+    //   lang:de (!"Sol Ring" or !"Cavern of Souls" or ...)
+    // Karten ohne Druck in der Zielsprache behalten das Original.
+    // Rückgabe: Namen, für die es keine Übersetzung gibt.
+    async function localizeBatch(resolved, lang, onProgress) {
+        const byName = new Map();   // Kartenname -> Listeneinträge
+        for (const [content, d] of resolved) {
+            if (!d || !d.name || d.lang === lang) continue;
+            const key = (d.layout === 'token' ? 'T:' : 'C:') + d.name;
+            if (!byName.has(key)) byName.set(key, { name: d.name, isToken: d.layout === 'token', contents: [] });
+            byName.get(key).contents.push(content);
+        }
+        if (!byName.size) return [];
+
+        const groups = [...byName.values()];
+        const found = new Map();    // Name -> übersetzte Karte
+
+        // Tokens getrennt behandeln, sonst kollidieren sie mit echten Karten
+        for (const isToken of [false, true]) {
+            const list = groups.filter(g => g.isToken === isToken);
+            if (!list.length) continue;
+
+            const prefix = `lang:${lang}${isToken ? ' is:token' : ''} (`;
+            // Scryfall schneidet Suchanfragen hart bei 1024 Zeichen ab. Die
+            // abgeschnittene Query verliert ihre schliessende Klammer und wird
+            // mit "unclosed parentheses" (HTTP 400) abgelehnt. Nachgemessen:
+            // 1024 Zeichen funktionieren, 1025 nicht. Mit Sicherheitsmarge:
+            const MAX_QUERY = 950;
+
+            const chunks = [];
+            let cur = [], len = prefix.length + 1;
+            for (const g of list) {
+                const cost = g.name.length + 3 + (cur.length ? 4 : 0); // !"name" + " or "
+                if (cur.length && len + cost > MAX_QUERY) { chunks.push(cur); cur = []; len = prefix.length + 1; }
+                cur.push(g); len += cost;
+            }
+            if (cur.length) chunks.push(cur);
+
+            let done = 0;
+            for (const chunk of chunks) {
+                onProgress(`Übersetze Karten ${done + 1}-${done + chunk.length} von ${list.length}...`);
+                done += chunk.length;
+                await runQuery(chunk, prefix, found, lang);
+            }
+        }
+
+        const untranslated = [];
+        for (const g of groups) {
+            const loc = found.get(g.name);
+            if (loc) g.contents.forEach(c => resolved.set(c, loc));
+            else untranslated.push(g.name);
+        }
+        return untranslated;
     }
 
     function toggleTheme() {
@@ -355,12 +449,9 @@
         }
 
         // Übersetzung nur nötig, wenn nicht Englisch (Scryfall liefert per Default en)
+        let untranslated = [];
         if (currentLang !== 'en') {
-            let n = 0;
-            for (const [content, data] of resolved) {
-                onProgress(`Übersetze ${++n}/${resolved.size}: ${data.name}`);
-                resolved.set(content, await localize(data, currentLang));
-            }
+            untranslated = await localizeBatch(resolved, currentLang, onProgress);
         }
 
         const failed = [];
@@ -381,10 +472,22 @@
         }
 
         renderPreview();
-        if (failed.length) {
-            const warn = document.createElement('p');
-            warn.style.cssText = 'color:#ff5d01;font-size:0.8rem;grid-column:1/-1;';
-            warn.innerText = `Nicht gefunden: ${[...new Set(failed)].join(', ')}`;
+
+        const notes = [];
+        if (failed.length) notes.push(`Nicht gefunden: ${[...new Set(failed)].join(', ')}`);
+        if (untranslated.length) {
+            const l = currentLang.toUpperCase();
+            notes.push(`Kein ${l}-Druck vorhanden (bleibt englisch): ${untranslated.join(', ')}`);
+        }
+        if (rateLimitHits) {
+            notes.push(`Scryfall-Limit wurde ${rateLimitHits}x erreicht - bitte erneut laden, ` +
+                       `falls Karten fehlen.`);
+            rateLimitHits = 0;
+        }
+        if (notes.length) {
+            const warn = document.createElement('div');
+            warn.style.cssText = 'color:#ff5d01;font-size:0.8rem;grid-column:1/-1;line-height:1.5;';
+            warn.innerText = notes.join('\n');
             grid.prepend(warn);
         }
     }
@@ -494,16 +597,20 @@
         };
 
         try {
-            // ---- Phase 1: Alle Bilder in maximaler Qualität laden (dedupliziert) ----
+            const lossless = document.getElementById('quality').value === 'lossless';
+
+            // ---- Phase 1: Alle Bilder in maximaler Auflösung laden (dedupliziert) ----
             const urls = [...new Set(cardData.map(c => c.highResImage || c.image))];
+            const ready = new Map();   // url -> einzubettendes Bild fuer diesen Lauf
             let loaded = 0, totalBytes = 0;
             setProgress(0, 1, `Lade ${urls.length} Bilder in Druckqualität...`);
 
             for (const url of urls) {
                 let img = await fetchOriginalImage(url);
                 if (!img) img = await fallbackImage(url);
+                if (img && !lossless) img = await toJpeg(url, img);
                 if (img) {
-                    hiResCache.set(url, img);
+                    ready.set(url, img);
                     totalBytes += img.bytes;
                 }
                 loaded++;
@@ -538,7 +645,7 @@
 
             for (let i = 0; i < cardData.length; i++) {
                 const url = cardData[i].highResImage || cardData[i].image;
-                const img = hiResCache.get(url);
+                const img = ready.get(url);
                 // DPI bezogen auf die tatsaechliche Druckbreite von 63 mm
                 const dpi = img && img.width ? ` @ ${Math.round(img.width / (CARD_W / 25.4))} DPI` : '';
                 setProgress(urls.length + i, urls.length + cardData.length,
@@ -553,8 +660,9 @@
 
                 if (!img) continue;
                 // alias = url -> identische Bilder werden nur einmal eingebettet.
-                // 'SLOW' = verlustfreie zlib-Kompression (Stufe 9). Nachweislich
-                // pixelidentisch zu 'NONE', aber ca. 4x kleinere Datei.
+                // 'SLOW' = verlustfreie zlib-Kompression (Stufe 9) für PNG,
+                // nachweislich pixelidentisch zu 'NONE', aber ca. 4x kleiner.
+                // Bei JPEG wird der Datenstrom unverändert durchgereicht (DCTDecode).
                 doc.addImage(img.dataUrl, img.format, x, y, w, h, url, 'SLOW');
             }
 
@@ -581,6 +689,41 @@
 
     // Cache: identische Bilder (z.B. 4x dieselbe Karte) werden nur einmal geladen.
     const hiResCache = new Map();
+    const jpegCache = new Map();
+
+    // Wandelt das verlustfreie PNG in ein JPEG mit 95% Qualität um.
+    // Die Auflösung (und damit die 300 DPI) bleibt unverändert - reduziert wird
+    // nur die Dateigröße, typischerweise auf etwa ein Zehntel.
+    // Wichtig: Scryfall-PNGs haben transparente, abgerundete Ecken. JPEG kennt
+    // keine Transparenz, deshalb wird zuerst weiß hinterlegt - sonst würden die
+    // Ecken beim Druck schwarz.
+    async function toJpeg(url, img) {
+        if (jpegCache.has(url)) return jpegCache.get(url);
+        if (img.format === 'JPEG') return img;
+        try {
+            const res = await fetch(img.dataUrl);
+            const bmp = await createImageBitmap(await res.blob());
+            const c = document.createElement('canvas');
+            c.width = bmp.width; c.height = bmp.height;
+            const ctx = c.getContext('2d');
+            ctx.fillStyle = '#ffffff';
+            ctx.fillRect(0, 0, c.width, c.height);
+            ctx.drawImage(bmp, 0, 0);
+            bmp.close();
+            const dataUrl = c.toDataURL('image/jpeg', 0.95);
+            const out = {
+                dataUrl,
+                format: 'JPEG',
+                // Base64 ist ca. 4/3 der Rohgröße
+                bytes: Math.round((dataUrl.length - dataUrl.indexOf(',') - 1) * 0.75),
+                width: c.width, height: c.height
+            };
+            jpegCache.set(url, out);
+            return out;
+        } catch (e) {
+            return img; // im Zweifel lieber verlustfrei als gar nicht
+        }
+    }
 
     // Lädt die Original-Bilddatei byte-genau von Scryfall. Es findet KEINE
     // Neukodierung über ein Canvas statt - die PNG-Datei landet unverändert
