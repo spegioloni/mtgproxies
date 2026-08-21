@@ -51,7 +51,10 @@
         .apply-all-overlay { position: absolute; bottom: 0; left: 0; right: 0; background: var(--accent); color: white; font-size: 0.55rem; font-weight: bold; padding: 4px; text-align: center; transform: translateY(100%); transition: 0.2s; }
         .art-option-container:hover .apply-all-overlay { transform: translateY(0); }
 
-        #status-bar { position: fixed; bottom: 1rem; right: 1rem; background: var(--accent-gradient); color: white; padding: 0.8rem 1.5rem; border-radius: 2rem; display: none; z-index: 1100; font-weight: bold; }
+        #status-bar { position: fixed; bottom: 1rem; right: 1rem; left: 1rem; max-width: 420px; margin-left: auto; background: var(--card-bg); border: 1px solid var(--border); color: var(--text); padding: 0.9rem 1.2rem; border-radius: 1rem; display: none; z-index: 1100; font-weight: bold; box-shadow: 0 8px 25px rgba(0,0,0,0.3); }
+        #status-label { font-size: 0.75rem; margin-bottom: 0.5rem; display: block; }
+        #status-track { width: 100%; height: 8px; background: var(--input-bg); border-radius: 1rem; overflow: hidden; }
+        #status-fill { height: 100%; width: 0%; background: var(--accent-gradient); transition: width 0.15s ease; }
     </style>
 </head>
 <body>
@@ -95,7 +98,10 @@
     </div>
 </div>
 
-<div id="status-bar">Verarbeite...</div>
+<div id="status-bar">
+    <span id="status-label">Verarbeite...</span>
+    <div id="status-track"><div id="status-fill"></div></div>
+</div>
 
 <script>
     let cardData = [];
@@ -205,13 +211,14 @@
             data = await localize(data, currentLang);
 
             if (data && (data.image_uris || data.card_faces)) {
-                const img = data.image_uris?.normal || data.card_faces[0].image_uris.normal;
+                const uris = data.image_uris || data.card_faces[0].image_uris;
                 for (let i = 0; i < count; i++) {
                     cardData.push({ 
                         id: data.id, 
                         name: data.name, 
                         originalSearchName: content, 
-                        image: img, 
+                        image: uris.normal, 
+                        highResImage: uris.png || uris.large || uris.normal,
                         isToken: data.layout === 'token' 
                     });
                 }
@@ -269,21 +276,24 @@
                 return;
             }
             data.data.forEach(print => {
-                const imgUrl = print.image_uris?.normal || print.card_faces[0].image_uris.normal;
+                const uris = print.image_uris || print.card_faces[0].image_uris;
+                const imgUrl = uris.normal;
+                const hiResUrl = uris.png || uris.large || uris.normal;
                 const container = document.createElement('div');
                 container.className = 'art-option-container';
                 container.innerHTML = `<img src="${imgUrl}"><div class="apply-all-overlay">ALT+KLICK: Alle</div>`;
                 container.onclick = (e) => {
-                    if (e.altKey) applyToAll(card.name, imgUrl, print.id, card.originalSearchName);
-                    else selectArt(imgUrl, print.id, card.originalSearchName);
+                    if (e.altKey) applyToAll(card.name, imgUrl, hiResUrl, print.id, card.originalSearchName);
+                    else selectArt(imgUrl, hiResUrl, print.id, card.originalSearchName);
                 };
                 artGrid.appendChild(container);
             });
         } catch (e) { artGrid.innerHTML = "Fehler beim Laden."; }
     }
 
-    function selectArt(url, id, originalName) {
+    function selectArt(url, hiResUrl, id, originalName) {
         cardData[currentEditIndex].image = url;
+        cardData[currentEditIndex].highResImage = hiResUrl;
         cardData[currentEditIndex].id = id;
         preferredArts[originalName] = id;
         localStorage.setItem('mtg_preferred_arts', JSON.stringify(preferredArts));
@@ -291,10 +301,11 @@
         closeModal();
     }
 
-    function applyToAll(name, imageUrl, id, originalName) {
+    function applyToAll(name, imageUrl, hiResUrl, id, originalName) {
         cardData.forEach(card => {
             if (card.name === name) {
                 card.image = imageUrl;
+                card.highResImage = hiResUrl;
                 card.id = id;
             }
         });
@@ -309,7 +320,10 @@
     async function generatePDF() {
         if (cardData.length === 0) return;
         const status = document.getElementById('status-bar');
+        const label = document.getElementById('status-label');
+        const fill = document.getElementById('status-fill');
         status.style.display = "block";
+        fill.style.width = "0%";
         
         const { jsPDF } = window.jspdf;
         const format = document.getElementById('pageSize').value;
@@ -318,14 +332,25 @@
         const w = 2.5, h = 3.5, perPage = is5x7 ? 4 : 9, cols = is5x7 ? 2 : 3;
 
         for (let i = 0; i < cardData.length; i++) {
-            status.innerText = `PDF wird erstellt: ${i+1}/${cardData.length}`;
+            const pct = Math.round((i / cardData.length) * 100);
+            fill.style.width = `${pct}%`;
+            label.innerText = `Lade Bild in max. Qualität: ${i+1}/${cardData.length} – ${cardData[i].name}`;
             if (i > 0 && i % perPage === 0) doc.addPage();
             const pIdx = i % perPage;
             const x = (is5x7 ? 0 : 0.44) + (pIdx % cols) * w;
             const y = (is5x7 ? 0 : 0.44) + Math.floor(pIdx / cols) * h;
-            const imgData = await getBase64(cardData[i].image);
-            doc.addImage(imgData, 'JPEG', x, y, w, h, undefined, 'FAST');
+            // Für den PDF-Export wird bewusst die höchste verfügbare Scryfall-Auflösung
+            // (png/large) nachgeladen statt der schnellen Vorschau-Version.
+            let { dataUrl, format: imgFormat } = await getHighResImage(cardData[i].highResImage || cardData[i].image);
+            if (!dataUrl) {
+                // Fallback auf die Vorschau-Auflösung, falls die High-Res-Variante nicht ladbar ist
+                ({ dataUrl, format: imgFormat } = await getHighResImage(cardData[i].image));
+            }
+            doc.addImage(dataUrl, imgFormat, x, y, w, h, undefined, 'NONE');
         }
+
+        fill.style.width = "100%";
+        label.innerText = "PDF wird gespeichert...";
 
         // Timestamp Generierung (YYMMDD_HHMM)
         const now = new Date();
@@ -338,21 +363,30 @@
         status.style.display = "none";
     }
 
-    function getBase64(url) {
+    // Lädt das Bild in maximaler Qualität und gibt es ohne verlustbehaftete
+    // Neukodierung zurück (PNG bleibt PNG, JPEG bleibt JPEG in hoher Qualität).
+    function getHighResImage(url) {
         return new Promise(resolve => {
+            const isPng = url.includes('/png/') || url.endsWith('.png') || url.includes('format=png');
             const img = new Image();
             img.crossOrigin = 'anonymous';
             img.onload = () => {
                 const c = document.createElement('canvas');
                 c.width = img.width; c.height = img.height;
                 const ctx = c.getContext('2d');
-                ctx.filter = 'brightness(1.05) saturate(1.02)';
                 ctx.drawImage(img, 0, 0);
-                resolve(c.toDataURL('image/jpeg', 0.8));
+                if (isPng) {
+                    resolve({ dataUrl: c.toDataURL('image/png'), format: 'PNG' });
+                } else {
+                    resolve({ dataUrl: c.toDataURL('image/jpeg', 0.98), format: 'JPEG' });
+                }
             };
-            img.src = url + "?cache=" + Date.now();
+            img.onerror = () => resolve({ dataUrl: null, format: 'JPEG' });
+            img.src = url + (url.includes('?') ? '&' : '?') + "cache=" + Date.now();
         });
     }
+
+
 </script>
 </body>
 </html>
