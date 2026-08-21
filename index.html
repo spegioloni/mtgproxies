@@ -45,9 +45,18 @@
         #artModal { display: none; position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.92); backdrop-filter: blur(8px); overflow-y: auto; }
         .modal-content { background: var(--card-bg); margin: 3% auto; padding: 2rem; width: 90%; max-width: 900px; border-radius: 1rem; border: 1px solid var(--border); }
         .art-selection-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 1rem; margin-top: 1rem; }
+        .art-lang-title { font-size: 0.75rem; font-weight: 700; color: var(--text-muted); letter-spacing: 0.08em; margin: 1.6rem 0 0; text-transform: uppercase; }
+        .art-lang-title:first-child { margin-top: 0.5rem; }
         .art-option-container { position: relative; cursor: pointer; transition: 0.2s; border-radius: 0.5rem; border: 2px solid transparent; overflow: hidden; }
         .art-option-container:hover { border-color: var(--accent); transform: translateY(-3px); }
         .art-option-container img { width: 100%; display: block; }
+        .art-option-container.current { border-color: #1a7f37; }
+        .badge { position: absolute; padding: 1px 5px; border-radius: 4px; font-size: 0.6rem; font-weight: 700; color: #fff; }
+        .badge-quality { top: 4px; left: 4px; }
+        .badge-lang { top: 4px; right: 4px; background: rgba(0,0,0,0.7); }
+        .badge-current { bottom: 4px; left: 4px; background: #1a7f37; }
+        .card-item { position: relative; }
+        .card-item .badge-quality { top: 10px; left: 10px; }
         .apply-all-overlay { position: absolute; bottom: 0; left: 0; right: 0; background: var(--accent); color: white; font-size: 0.55rem; font-weight: bold; padding: 4px; text-align: center; transform: translateY(100%); transition: 0.2s; }
         .art-option-container:hover .apply-all-overlay { transform: translateY(0); }
 
@@ -101,8 +110,12 @@
     <div class="modal-content">
         <span style="float:right; cursor:pointer;" onclick="closeModal()">✕</span>
         <h2 id="modalTitle" style="margin-top:0;">Variante wählen</h2>
-        <p style="font-size: 0.8rem; color: var(--text-muted);">Klick: Einzeln | <b>ALT + Klick</b>: Alle gleichen Karten</p>
-        <div id="artSelectionGrid" class="art-selection-grid"></div>
+        <p style="font-size: 0.8rem; color: var(--text-muted);">
+            Vorausgewählt ist die Variante des Schärfe-Algorithmus (grün umrandet).
+            Der Wert im Badge ist die gemessene Bildschärfe - höher ist besser.<br>
+            Klick: Einzeln | <b>ALT + Klick</b>: Alle gleichen Karten
+        </p>
+        <div id="artSelectionGrid"></div>
     </div>
 </div>
 
@@ -782,22 +795,44 @@
         }
     }
 
+    let previewToken = 0;
+
     function renderPreview() {
         const grid = document.getElementById('cardGrid');
         grid.innerHTML = cardData.length ? '' : '<p>Keine Karten in der Vorschau.</p>';
+        const pending = [];
         cardData.forEach((card, i) => {
             const div = document.createElement('div');
             div.className = 'card-item';
             div.innerHTML = `
                 <img src="${card.image}" id="main-img-${i}">
+                <div class="badge badge-quality"></div>
                 <div class="card-actions">
                     <button class="btn-round" onclick="removeCard(${i})">−</button>
                     <button class="btn-art" onclick="openArtPicker(${i})">VARIANTE</button>
                     <button class="btn-round" onclick="duplicateCard(${i})">+</button>
                 </div>
             `;
+            const badge = div.querySelector('.badge-quality');
+            setBadge(badge, card.sharpness ?? null, card.sharpness != null);
+            if (card.sharpness == null) pending.push({ card, badge });
             grid.appendChild(div);
         });
+        if (pending.length) measurePreview(pending, ++previewToken);
+    }
+
+    // Nachträglich messen, was beim Laden nicht gemessen wurde (scharf
+    // gescannte Drucke). Der Cache macht Wiederholungen kostenlos.
+    async function measurePreview(pending, token) {
+        for (let i = 0; i < pending.length; i += MEASURE_BATCH) {
+            const batch = pending.slice(i, i + MEASURE_BATCH);
+            await Promise.all(batch.map(async p => {
+                const v = await measureSharpness(p.card.image);
+                p.card.sharpness = v;
+                setBadge(p.badge, v, true);
+            }));
+            if (token !== previewToken) return;
+        }
     }
 
     function duplicateCard(i) {
@@ -811,6 +846,44 @@
         renderPreview();
     }
 
+    // Übersetzt einen Schärfewert in ein Badge. Der rohe Wert wird bewusst
+    // mit angezeigt: "unscharf" allein sagt nicht, ob es knapp daneben ist
+    // (z.B. 2100) oder hoffnungslos (Boseiju DE: 79).
+    function qualityInfo(score, measured) {
+        if (score == null) {
+            return measured
+                ? { text: '?', color: '#4b5563', tip: 'Schärfe konnte nicht gemessen werden' }
+                : { text: 'MESSE…', color: '#4b5563', tip: 'Schärfe wird gemessen…' };
+        }
+        const v = Math.round(score);
+        const tip = `Schärfewert ${v} (Varianz des Laplace-Operators, ab ${SHARP_MIN} scharf genug für den Druck)`;
+        if (score >= SHARP_MIN) return { text: `SCHARF ${v}`, color: '#1a7f37', tip };
+        if (score >= SHARP_MIN * 0.6) return { text: `MITTEL ${v}`, color: '#b35309', tip };
+        return { text: `UNSCHARF ${v}`, color: '#b3261e', tip };
+    }
+
+    // Lädt alle Drucke der Karte in Zielsprache UND Englisch.
+    async function fetchPrints(card, langs) {
+        const langFilter = langs.map(l => `lang:${l}`).join(' or ');
+        const q = card.isToken ? `!"${card.name}" is:token unique:prints (${langFilter})`
+                               : `!"${card.name}" unique:prints (${langFilter})`;
+        let url = `https://api.scryfall.com/cards/search?q=${encodeURIComponent(q)}&order=released&dir=desc`;
+        const prints = [];
+        let guard = 0;
+        while (url && guard++ < 10) {
+            const res = await scryfallFetch(url);
+            if (!res || !res.data) break;
+            for (const p of res.data) {
+                const u = p.image_uris || (p.card_faces && p.card_faces[0].image_uris);
+                if (u && u.normal) prints.push(p);
+            }
+            url = res.has_more ? res.next_page : null;
+        }
+        return prints;
+    }
+
+    let artPickerToken = 0;   // verwirft Messungen eines zwischenzeitlich geschlossenen Modals
+
     async function openArtPicker(index) {
         currentEditIndex = index;
         const card = cardData[index];
@@ -819,60 +892,124 @@
         document.getElementById('modalTitle').innerText = card.name;
         modal.style.display = "block";
         artGrid.innerHTML = "Lade Varianten...";
+        const token = ++artPickerToken;
 
+        // Zielsprache zuerst, Englisch als Zweitwahl - so ist die bevorzugte
+        // Sprache oben, ohne dass englische Drucke versteckt bleiben.
+        const langs = currentLang === 'en' ? ['en'] : [currentLang, 'en'];
+        const langNames = { en: 'Englisch', de: 'Deutsch', fr: 'Französisch', es: 'Spanisch',
+                            it: 'Italienisch', pt: 'Portugiesisch', ja: 'Japanisch', ru: 'Russisch' };
+
+        let prints;
         try {
-            const langFilter = ` lang:${currentLang}`;
-            const q = card.isToken ? `!"${card.name}" is:token${langFilter}` : `!"${card.name}" unique:prints${langFilter}`;
-            const data = await scryfallFetch(`https://api.scryfall.com/cards/search?q=${encodeURIComponent(q)}`);
-            artGrid.innerHTML = "";
-            if (!data || !data.data || !data.data.length) {
-                artGrid.innerHTML = `Keine Varianten in dieser Sprache (${currentLang}) gefunden.`;
-                return;
-            }
-            // Scharfe Scans zuerst anzeigen - das ist die für den Druck relevante Reihenfolge
-            data.data.sort((a, b) => (b.image_status === 'highres_scan') - (a.image_status === 'highres_scan'));
-            data.data.forEach(print => {
+            prints = await fetchPrints(card, langs);
+        } catch (e) { artGrid.innerHTML = "Fehler beim Laden."; return; }
+        if (token !== artPickerToken) return;
+
+        if (!prints.length) {
+            artGrid.innerHTML = `Keine Varianten gefunden.`;
+            return;
+        }
+
+        artGrid.innerHTML = "";
+        const tiles = [];
+        const sections = new Set();
+
+        for (const lang of langs) {
+            const inLang = prints.filter(p => p.lang === lang);
+            if (!inLang.length) continue;
+
+            // Vorsortierung, bis die Messwerte da sind: scharfe Scans zuerst.
+            inLang.sort((a, b) => (b.image_status === 'highres_scan') - (a.image_status === 'highres_scan'));
+
+            const title = document.createElement('p');
+            title.className = 'art-lang-title';
+            title.innerText = `${langNames[lang] || lang.toUpperCase()} (${inLang.length})`;
+            artGrid.appendChild(title);
+
+            const section = document.createElement('div');
+            section.className = 'art-selection-grid';
+            artGrid.appendChild(section);
+
+            for (const print of inLang) {
                 const uris = print.image_uris || print.card_faces[0].image_uris;
                 const imgUrl = uris.normal;
                 const hiResUrl = uris.png || uris.large || uris.normal;
-                const sharp = print.image_status === 'highres_scan';
+                const isCurrent = print.id === card.id;
+
                 const container = document.createElement('div');
-                container.className = 'art-option-container';
-                container.title = sharp ? 'Scharfer Scan - für den Druck geeignet'
-                                        : 'Nur hochskalierter Scan - im Druck unscharf';
-                container.innerHTML = `<img src="${imgUrl}">` +
+                container.className = 'art-option-container' + (isCurrent ? ' current' : '');
+                container.innerHTML =
+                    `<img src="${imgUrl}" loading="lazy">` +
                     `<div class="apply-all-overlay">ALT+KLICK: Alle</div>` +
-                    `<div style="position:absolute;top:4px;left:4px;padding:1px 5px;border-radius:4px;` +
-                    `font-size:0.6rem;font-weight:700;background:${sharp ? '#1a7f37' : '#b35309'};color:#fff;">` +
-                    `${sharp ? 'SCHARF' : 'UNSCHARF'}</div>`;
-                container.style.position = 'relative';
+                    `<div class="badge badge-quality"></div>` +
+                    `<div class="badge badge-lang">${print.lang.toUpperCase()} · ${print.set.toUpperCase()}</div>` +
+                    (isCurrent ? `<div class="badge badge-current">AKTUELL</div>` : '');
                 container.onclick = (e) => {
-                    if (e.altKey) applyToAll(card.name, imgUrl, hiResUrl, print.id, card.originalSearchName, print.image_status);
-                    else selectArt(imgUrl, hiResUrl, print.id, card.originalSearchName, print.image_status);
+                    const score = tile.score;
+                    if (e.altKey) applyToAll(card.name, imgUrl, hiResUrl, print.id, card.originalSearchName, print.image_status, score);
+                    else selectArt(imgUrl, hiResUrl, print.id, card.originalSearchName, print.image_status, score);
                 };
-                artGrid.appendChild(container);
-            });
-        } catch (e) { artGrid.innerHTML = "Fehler beim Laden."; }
+                section.appendChild(container);
+
+                const tile = { print, container, url: imgUrl, score: null,
+                               badge: container.querySelector('.badge-quality') };
+                container._tile = tile;
+                setBadge(tile.badge, null);
+                tiles.push(tile);
+                sections.add(section);
+            }
+        }
+
+        // Schärfe aller Varianten messen - in kleinen Runden, damit der Browser
+        // bei 40 Varianten nicht einfriert. Werte aus dem Ladevorgang liegen
+        // bereits im Cache und erscheinen sofort.
+        for (let i = 0; i < tiles.length; i += MEASURE_BATCH) {
+            const batch = tiles.slice(i, i + MEASURE_BATCH);
+            await Promise.all(batch.map(async t => {
+                t.score = await measureSharpness(t.url);
+                setBadge(t.badge, t.score, true);
+            }));
+            if (token !== artPickerToken) return;
+        }
+
+        // Nach der Messung je Sprache nach Schärfe sortieren: die beste
+        // Variante steht oben, die Auswahl bleibt aber frei.
+        for (const section of sections) {
+            [...section.children]
+                .sort((a, b) => (b._tile.score ?? -1) - (a._tile.score ?? -1))
+                .forEach(el => section.appendChild(el));
+        }
     }
 
-    function selectArt(url, hiResUrl, id, originalName, imageStatus) {
+    function setBadge(el, score, measured) {
+        const q = qualityInfo(score, measured);
+        el.innerText = q.text;
+        el.style.background = q.color;
+        el.title = q.tip;
+        if (el.parentElement) el.parentElement.title = q.tip;
+    }
+
+    function selectArt(url, hiResUrl, id, originalName, imageStatus, sharpness) {
         cardData[currentEditIndex].image = url;
         cardData[currentEditIndex].highResImage = hiResUrl;
         cardData[currentEditIndex].id = id;
         cardData[currentEditIndex].imageStatus = imageStatus;
+        cardData[currentEditIndex].sharpness = sharpness;
         preferredArts[originalName] = id;
         localStorage.setItem('mtg_preferred_arts', JSON.stringify(preferredArts));
-        document.getElementById(`main-img-${currentEditIndex}`).src = url;
+        renderPreview();
         closeModal();
     }
 
-    function applyToAll(name, imageUrl, hiResUrl, id, originalName, imageStatus) {
+    function applyToAll(name, imageUrl, hiResUrl, id, originalName, imageStatus, sharpness) {
         cardData.forEach(card => {
             if (card.name === name) {
                 card.image = imageUrl;
                 card.highResImage = hiResUrl;
                 card.id = id;
                 card.imageStatus = imageStatus;
+                card.sharpness = sharpness;
             }
         });
         preferredArts[originalName] = id;
