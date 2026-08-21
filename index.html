@@ -135,22 +135,121 @@
         if (cardData.length) loadCards();
     }
 
+    // ==================================================================
+    // Scryfall-API-Schicht: Rate-Limiting, Caching und Retry
+    // ------------------------------------------------------------------
+    // Scryfall erlaubt hart max. 10 Requests/Sekunde. Bei Überschreitung
+    // kommt HTTP 429 (30 Sekunden Sperre), bei wiederholtem Verstoß droht
+    // ein dauerhafter Bann. Da 429-Antworten keine CORS-Header tragen,
+    // erscheinen sie im Browser irreführend als CORS-Fehler.
+    // Deshalb: alle API-Aufrufe streng serialisiert mit Mindestabstand.
+    // Bild-Downloads von *.scryfall.io haben KEIN Limit und laufen hier
+    // bewusst nicht durch die Warteschlange.
+    // ==================================================================
+    const API_GAP = 120;         // ms Mindestabstand (< 10/s mit Sicherheitsmarge)
+    const COLLECTION_GAP = 550;  // /cards/collection ist auf 2/s limitiert
+    const CACHE_TTL = 24 * 60 * 60 * 1000; // Scryfall bittet um >=24h Caching
+
+    let apiQueue = Promise.resolve();
+    let lastApiCall = 0;
+
+    const memCache = new Map();
+    const inFlight = new Map();
+
+    function cacheKey(url, body) { return body ? url + '|' + body : url; }
+
+    function cacheGet(key) {
+        if (memCache.has(key)) return memCache.get(key);
+        try {
+            const raw = localStorage.getItem('sf_' + key);
+            if (raw) {
+                const e = JSON.parse(raw);
+                if (Date.now() - e.t < CACHE_TTL) { memCache.set(key, e.v); return e.v; }
+                localStorage.removeItem('sf_' + key);
+            }
+        } catch (e) { /* defektes Cache-Item ignorieren */ }
+        return null;
+    }
+
+    function cacheSet(key, value) {
+        memCache.set(key, value);
+        try {
+            const s = JSON.stringify({ t: Date.now(), v: value });
+            // Grosse Batch-Antworten sprengen die localStorage-Quota (ca. 5 MB).
+            // Sie bleiben im Speicher-Cache, werden aber nicht persistiert.
+            if (s.length > 100000) return;
+            localStorage.setItem('sf_' + key, s);
+        } catch (e) {
+            // Quota voll: alte Scryfall-Einträge verwerfen, Deckliste behalten
+            try {
+                Object.keys(localStorage).filter(k => k.startsWith('sf_')).forEach(k => localStorage.removeItem(k));
+            } catch (e2) { /* aufgeben, In-Memory-Cache reicht */ }
+        }
+    }
+
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+    // Serialisierter, rate-limitierter Fetch mit Backoff bei 429.
+    function scryfallFetch(url, { body = null, gap = API_GAP, retries = 3 } = {}) {
+        const key = cacheKey(url, body);
+        const hit = cacheGet(key);
+        if (hit) return Promise.resolve(hit);
+        // Identische Anfrage läuft bereits -> anhängen statt doppelt abfragen
+        if (inFlight.has(key)) return inFlight.get(key);
+
+        const run = async () => {
+            for (let attempt = 0; ; attempt++) {
+                const wait = lastApiCall + gap - Date.now();
+                if (wait > 0) await sleep(wait);
+                lastApiCall = Date.now();
+                try {
+                    const opts = { headers: { 'Accept': 'application/json' } };
+                    if (body) {
+                        opts.method = 'POST';
+                        opts.body = body;
+                        opts.headers['Content-Type'] = 'application/json';
+                    }
+                    const res = await fetch(url, opts);
+                    if (res.status === 429) throw new Error('rate_limited');
+                    if (res.status === 404) return null;   // Karte existiert nicht
+                    if (!res.ok && res.status >= 500) throw new Error('server_' + res.status);
+                    const json = await res.json();
+                    if (json.object === 'error' && json.status === 429) throw new Error('rate_limited');
+                    cacheSet(key, json);
+                    return json;
+                } catch (e) {
+                    if (attempt >= retries) return null;
+                    // 429 sperrt laut Scryfall 30s -> deutlich zurückfahren
+                    const backoff = e.message === 'rate_limited' ? 5000 * (attempt + 1) : 700 * (attempt + 1);
+                    setLoadStatus(`Scryfall-Limit erreicht, warte ${Math.round(backoff / 1000)}s...`);
+                    await sleep(backoff);
+                }
+            }
+        };
+
+        apiQueue = apiQueue.then(run, run);
+        const p = apiQueue.finally(() => inFlight.delete(key));
+        inFlight.set(key, p);
+        return p;
+    }
+
+    function setLoadStatus(text) {
+        const grid = document.getElementById('cardGrid');
+        const p = grid.querySelector('.load-status');
+        if (p) p.innerText = text;
+    }
+
     // Versucht, eine Karte (per set/collector_number) in der gewünschten Sprache zu laden.
     // Fällt bei fehlender Übersetzung auf die Originalkarte zurück.
     // Sucht über ALLE Editionen der Karte (nicht nur den zuletzt gefundenen Druck),
     // da nicht jeder Druck (z.B. Secret Lair/Sonderdrucke) in jeder Sprache existiert.
     async function localize(data, lang) {
         if (!data || data.lang === lang || !data.name) return data;
-        try {
-            const isToken = data.layout === 'token';
-            const q = `!"${data.name}" lang:${lang}${isToken ? ' is:token' : ''}`;
-            const res = await fetch(`https://api.scryfall.com/cards/search?q=${encodeURIComponent(q)}&order=released&dir=desc`);
-            if (res.ok) {
-                const j = await res.json();
-                const t = j.data && j.data[0];
-                if (t && (t.image_uris || t.card_faces)) return t;
-            }
-        } catch (e) { /* ignore, keep original */ }
+        const isToken = data.layout === 'token';
+        const q = `!"${data.name}" lang:${lang}${isToken ? ' is:token' : ''}`;
+        const j = await scryfallFetch(`https://api.scryfall.com/cards/search?q=${encodeURIComponent(q)}&order=released&dir=desc`);
+        const t = j && j.data && j.data[0];
+        if (t && (t.image_uris || t.card_faces)) return t;
         return data; // keine Übersetzung gefunden -> Original behalten
     }
 
@@ -168,63 +267,126 @@
     async function resolveInput(input) {
         input = input.trim();
         if (input.includes('scryfall.com/card/')) {
-            try {
-                const parts = input.split('/card/')[1].split('/');
-                const res = await fetch(`https://api.scryfall.com/cards/${parts[0]}/${parts[1]}`);
-                return await res.json();
-            } catch (e) { return null; }
+            const parts = input.split('/card/')[1].split('/');
+            return await scryfallFetch(`https://api.scryfall.com/cards/${parts[0]}/${parts[1]}`);
         }
-        try {
-            let url = `https://api.scryfall.com/cards/named?fuzzy=${encodeURIComponent(input)}`;
-            if (input.toLowerCase().includes('token')) {
-                const clean = input.toLowerCase().replace('token', '').trim();
-                url = `https://api.scryfall.com/cards/search?q=${encodeURIComponent(clean)}+is%3Atoken`;
+        if (input.toLowerCase().includes('token')) {
+            const clean = input.toLowerCase().replace('token', '').trim();
+            const d = await scryfallFetch(`https://api.scryfall.com/cards/search?q=${encodeURIComponent(clean)}+is%3Atoken`);
+            return d && d.data ? d.data[0] : null;
+        }
+        // Fuzzy-Suche als Rückfallebene, wenn der Batch-Abgleich den Namen nicht kannte
+        const data = await scryfallFetch(`https://api.scryfall.com/cards/named?fuzzy=${encodeURIComponent(input)}`);
+        return data && data.id ? data : null;
+    }
+
+    // Löst viele Kartennamen mit möglichst wenigen Requests auf.
+    // /cards/collection nimmt bis zu 75 Karten pro Request entgegen -
+    // statt 75 Einzelabfragen (die zwangsläufig ins Rate-Limit laufen).
+    async function resolveBatch(entries, onProgress) {
+        const result = new Map();   // content -> Kartendaten
+        const viaCollection = [];   // Einträge, die der Batch abdeckt
+
+        for (const content of entries) {
+            if (preferredArts[content]) {
+                viaCollection.push({ content, ident: { id: preferredArts[content] } });
+            } else if (content.includes('scryfall.com/card/')) {
+                const p = content.split('/card/')[1].split('/');
+                viaCollection.push({ content, ident: { set: p[0], collector_number: p[1] } });
+            } else if (!content.toLowerCase().includes('token')) {
+                viaCollection.push({ content, ident: { name: content } });
             }
-            const res = await fetch(url);
-            const data = await res.json();
-            return data.id ? data : (data.data ? data.data[0] : null);
-        } catch (e) { return null; }
+        }
+
+        for (let i = 0; i < viaCollection.length; i += 75) {
+            const chunk = viaCollection.slice(i, i + 75);
+            onProgress(`Suche Karten ${i + 1}-${i + chunk.length} von ${viaCollection.length}...`);
+            const body = JSON.stringify({ identifiers: chunk.map(c => c.ident) });
+            const res = await scryfallFetch('https://api.scryfall.com/cards/collection',
+                                            { body, gap: COLLECTION_GAP });
+            if (!res || !res.data) continue;
+            // Reihenfolge ist nicht verlässlich, wenn Karten fehlen -> per Name/ID zuordnen
+            for (const card of res.data) {
+                const match = chunk.find(c =>
+                    (c.ident.id && c.ident.id === card.id) ||
+                    (c.ident.collector_number && c.ident.set === card.set &&
+                     c.ident.collector_number === card.collector_number) ||
+                    (c.ident.name && c.ident.name.toLowerCase() === card.name.toLowerCase()) ||
+                    (c.ident.name && card.name.toLowerCase().startsWith(c.ident.name.toLowerCase() + ' //')));
+                if (match && !result.has(match.content)) result.set(match.content, card);
+            }
+        }
+
+        // Nicht gefundene Namen (Tippfehler, Tokens, Sonderfälle) einzeln nachschlagen
+        const missing = entries.filter(c => !result.has(c));
+        for (let i = 0; i < missing.length; i++) {
+            onProgress(`Einzelsuche ${i + 1}/${missing.length}: ${missing[i]}`);
+            const d = await resolveInput(missing[i]);
+            if (d) result.set(missing[i], d);
+        }
+        return result;
     }
 
     async function loadCards() {
         const input = document.getElementById('listInput').value;
         // Liste im localStorage speichern
         localStorage.setItem('mtg_last_decklist', input);
-        
+
         const grid = document.getElementById('cardGrid');
-        grid.innerHTML = '<p>Lade Karten...</p>';
+        grid.innerHTML = '<p class="load-status">Lade Karten...</p>';
         cardData = [];
 
         const lines = input.split('\n').filter(l => l.trim());
-        for (let line of lines) {
-            let count = 1, content = line.trim();
-            const match = content.match(/^(\d+)\s+(.*)$/);
-            if (match) { count = parseInt(match[1]); content = match[2]; }
+        const parsed = lines.map(line => {
+            const m = line.trim().match(/^(\d+)\s+(.*)$/);
+            return m ? { count: parseInt(m[1]), content: m[2] } : { count: 1, content: line.trim() };
+        });
 
-            let data = null;
-            if (preferredArts[content]) {
-                const res = await fetch(`https://api.scryfall.com/cards/${preferredArts[content]}`);
-                data = await res.json();
-            } else {
-                data = await resolveInput(content);
-            }
-            data = await localize(data, currentLang);
+        // Gleiche Karte mehrfach in der Liste -> nur einmal abfragen
+        const unique = [...new Set(parsed.map(p => p.content))];
+        const onProgress = t => setLoadStatus(t);
 
-            if (data && (data.image_uris || data.card_faces)) {
-                const uris = data.image_uris || data.card_faces[0].image_uris;
-                for (let i = 0; i < count; i++) {
-                    cardData.push({ 
-                        id: data.id, 
-                        name: data.name, 
-                        originalSearchName: content, 
-                        image: uris.normal, 
-                        highResImage: uris.png || uris.large || uris.normal,
-                        isToken: data.layout === 'token' 
-                    });
-                }
+        let resolved;
+        try {
+            resolved = await resolveBatch(unique, onProgress);
+        } catch (e) {
+            grid.innerHTML = `<p>Fehler beim Laden: ${e.message}</p>`;
+            return;
+        }
+
+        // Übersetzung nur nötig, wenn nicht Englisch (Scryfall liefert per Default en)
+        if (currentLang !== 'en') {
+            let n = 0;
+            for (const [content, data] of resolved) {
+                onProgress(`Übersetze ${++n}/${resolved.size}: ${data.name}`);
+                resolved.set(content, await localize(data, currentLang));
             }
         }
+
+        const failed = [];
+        for (const { count, content } of parsed) {
+            const data = resolved.get(content);
+            if (!data || !(data.image_uris || data.card_faces)) { failed.push(content); continue; }
+            const uris = data.image_uris || data.card_faces[0].image_uris;
+            for (let i = 0; i < count; i++) {
+                cardData.push({
+                    id: data.id,
+                    name: data.name,
+                    originalSearchName: content,
+                    image: uris.normal,
+                    highResImage: uris.png || uris.large || uris.normal,
+                    isToken: data.layout === 'token'
+                });
+            }
+        }
+
         renderPreview();
+        if (failed.length) {
+            const warn = document.createElement('p');
+            warn.style.cssText = 'color:#ff5d01;font-size:0.8rem;grid-column:1/-1;';
+            warn.innerText = `Nicht gefunden: ${[...new Set(failed)].join(', ')}`;
+            grid.prepend(warn);
+        }
     }
 
     function renderPreview() {
@@ -268,10 +430,9 @@
         try {
             const langFilter = ` lang:${currentLang}`;
             const q = card.isToken ? `!"${card.name}" is:token${langFilter}` : `!"${card.name}" unique:prints${langFilter}`;
-            const res = await fetch(`https://api.scryfall.com/cards/search?q=${encodeURIComponent(q)}`);
-            const data = await res.json();
+            const data = await scryfallFetch(`https://api.scryfall.com/cards/search?q=${encodeURIComponent(q)}`);
             artGrid.innerHTML = "";
-            if (!data.data || !data.data.length) {
+            if (!data || !data.data || !data.data.length) {
                 artGrid.innerHTML = `Keine Varianten in dieser Sprache (${currentLang}) gefunden.`;
                 return;
             }
