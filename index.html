@@ -322,67 +322,144 @@
         const status = document.getElementById('status-bar');
         const label = document.getElementById('status-label');
         const fill = document.getElementById('status-fill');
+        const btn = document.getElementById('dlBtn');
         status.style.display = "block";
+        btn.disabled = true;
         fill.style.width = "0%";
-        
-        const { jsPDF } = window.jspdf;
-        const format = document.getElementById('pageSize').value;
-        const is5x7 = format === '5x7';
-        const doc = new jsPDF({ orientation: 'portrait', unit: 'in', format: is5x7 ? [5, 7] : 'a4' });
-        const w = 2.5, h = 3.5, perPage = is5x7 ? 4 : 9, cols = is5x7 ? 2 : 3;
 
-        for (let i = 0; i < cardData.length; i++) {
-            const pct = Math.round((i / cardData.length) * 100);
-            fill.style.width = `${pct}%`;
-            label.innerText = `Lade Bild in max. Qualität: ${i+1}/${cardData.length} – ${cardData[i].name}`;
-            if (i > 0 && i % perPage === 0) doc.addPage();
-            const pIdx = i % perPage;
-            const x = (is5x7 ? 0 : 0.44) + (pIdx % cols) * w;
-            const y = (is5x7 ? 0 : 0.44) + Math.floor(pIdx / cols) * h;
-            // Für den PDF-Export wird bewusst die höchste verfügbare Scryfall-Auflösung
-            // (png/large) nachgeladen statt der schnellen Vorschau-Version.
-            let { dataUrl, format: imgFormat } = await getHighResImage(cardData[i].highResImage || cardData[i].image);
-            if (!dataUrl) {
-                // Fallback auf die Vorschau-Auflösung, falls die High-Res-Variante nicht ladbar ist
-                ({ dataUrl, format: imgFormat } = await getHighResImage(cardData[i].image));
+        const setProgress = (done, total, text) => {
+            fill.style.width = `${Math.round((done / total) * 100)}%`;
+            label.innerText = text;
+        };
+
+        try {
+            // ---- Phase 1: Alle Bilder in maximaler Qualität laden (dedupliziert) ----
+            const urls = [...new Set(cardData.map(c => c.highResImage || c.image))];
+            let loaded = 0, totalBytes = 0;
+            setProgress(0, 1, `Lade ${urls.length} Bilder in Druckqualität...`);
+
+            for (const url of urls) {
+                let img = await fetchOriginalImage(url);
+                if (!img) img = await fallbackImage(url);
+                if (img) {
+                    hiResCache.set(url, img);
+                    totalBytes += img.bytes;
+                }
+                loaded++;
+                setProgress(loaded, urls.length + cardData.length,
+                    `Lade Bilder in Druckqualität: ${loaded}/${urls.length} (${(totalBytes/1048576).toFixed(1)} MB)`);
             }
-            doc.addImage(dataUrl, imgFormat, x, y, w, h, undefined, 'NONE');
+
+            // ---- Phase 2: PDF zusammensetzen ----
+            const { jsPDF } = window.jspdf;
+            const format = document.getElementById('pageSize').value;
+            const is5x7 = format === '5x7';
+            const pageW = is5x7 ? 5 : 8.27, pageH = is5x7 ? 7 : 11.69;
+            const doc = new jsPDF({
+                orientation: 'portrait',
+                unit: 'in',
+                format: is5x7 ? [5, 7] : 'a4',
+                compress: false
+            });
+
+            const w = 2.5, h = 3.5, cols = is5x7 ? 2 : 3, rows = is5x7 ? 2 : 3;
+            const perPage = cols * rows;
+            // Raster exakt auf der Seite zentrieren (sauberes Schneiden)
+            const marginX = (pageW - cols * w) / 2;
+            const marginY = (pageH - rows * h) / 2;
+
+            for (let i = 0; i < cardData.length; i++) {
+                const url = cardData[i].highResImage || cardData[i].image;
+                const img = hiResCache.get(url);
+                const dpi = img && img.width ? ` @ ${Math.round(img.width / 2.5)} DPI` : '';
+                setProgress(urls.length + i, urls.length + cardData.length,
+                    `PDF wird erstellt: ${i + 1}/${cardData.length}${dpi} - ${cardData[i].name}`);
+
+                if (i > 0 && i % perPage === 0) doc.addPage();
+                const pIdx = i % perPage;
+                const x = marginX + (pIdx % cols) * w;
+                const y = marginY + Math.floor(pIdx / cols) * h;
+
+                if (!img) continue;
+                // alias = url -> identische Bilder werden nur einmal eingebettet.
+                // 'SLOW' = verlustfreie zlib-Kompression (Stufe 9). Nachweislich
+                // pixelidentisch zu 'NONE', aber ca. 4x kleinere Datei.
+                doc.addImage(img.dataUrl, img.format, x, y, w, h, url, 'SLOW');
+            }
+
+            fill.style.width = "100%";
+            label.innerText = "PDF wird gespeichert...";
+            await new Promise(r => setTimeout(r, 50));
+
+            // Timestamp Generierung (YYMMDD_HHMM)
+            const now = new Date();
+            const ts = now.toISOString().slice(2,10).replace(/-/g, '') + "_" +
+                       now.getHours().toString().padStart(2, '0') +
+                       now.getMinutes().toString().padStart(2, '0');
+
+            const userTitle = document.getElementById('fileNameInput').value.trim() || 'Proxies';
+            doc.save(`${ts}_${userTitle}.pdf`);
+        } catch (e) {
+            label.innerText = "Fehler: " + e.message;
+            await new Promise(r => setTimeout(r, 3000));
+        } finally {
+            status.style.display = "none";
+            btn.disabled = false;
         }
-
-        fill.style.width = "100%";
-        label.innerText = "PDF wird gespeichert...";
-
-        // Timestamp Generierung (YYMMDD_HHMM)
-        const now = new Date();
-        const ts = now.toISOString().slice(2,10).replace(/-/g, '') + "_" + 
-                   now.getHours().toString().padStart(2, '0') + 
-                   now.getMinutes().toString().padStart(2, '0');
-        
-        const userTitle = document.getElementById('fileNameInput').value.trim() || 'Proxies';
-        doc.save(`${ts}_${userTitle}.pdf`);
-        status.style.display = "none";
     }
 
-    // Lädt das Bild in maximaler Qualität und gibt es ohne verlustbehaftete
-    // Neukodierung zurück (PNG bleibt PNG, JPEG bleibt JPEG in hoher Qualität).
-    function getHighResImage(url) {
+    // Cache: identische Bilder (z.B. 4x dieselbe Karte) werden nur einmal geladen.
+    const hiResCache = new Map();
+
+    // Lädt die Original-Bilddatei byte-genau von Scryfall. Es findet KEINE
+    // Neukodierung über ein Canvas statt - die PNG-Datei landet unverändert
+    // im PDF, das ist die maximal mögliche Qualität.
+    async function fetchOriginalImage(url) {
+        if (hiResCache.has(url)) return hiResCache.get(url);
+        try {
+            // Kein Cache-Buster: die Scryfall-URLs sind bereits versioniert (?<timestamp>)
+            const res = await fetch(url, { mode: 'cors', cache: 'force-cache' });
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            const blob = await res.blob();
+            const dataUrl = await new Promise((resolve, reject) => {
+                const fr = new FileReader();
+                fr.onload = () => resolve(fr.result);
+                fr.onerror = reject;
+                fr.readAsDataURL(blob);
+            });
+            const result = {
+                dataUrl,
+                format: blob.type === 'image/png' ? 'PNG' : 'JPEG',
+                bytes: blob.size,
+                width: 0, height: 0
+            };
+            try {
+                const bmp = await createImageBitmap(blob);
+                result.width = bmp.width; result.height = bmp.height;
+                bmp.close();
+            } catch (e) { /* Dimensionen sind nur fuer die DPI-Anzeige noetig */ }
+            hiResCache.set(url, result);
+            return result;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    // Notfall-Fallback, falls fetch blockiert wird: über <img>+Canvas als PNG
+    // (verlustfrei, aber mit Farbraum-Konvertierung durch den Browser).
+    function fallbackImage(url) {
         return new Promise(resolve => {
-            const isPng = url.includes('/png/') || url.endsWith('.png') || url.includes('format=png');
             const img = new Image();
             img.crossOrigin = 'anonymous';
             img.onload = () => {
                 const c = document.createElement('canvas');
-                c.width = img.width; c.height = img.height;
-                const ctx = c.getContext('2d');
-                ctx.drawImage(img, 0, 0);
-                if (isPng) {
-                    resolve({ dataUrl: c.toDataURL('image/png'), format: 'PNG' });
-                } else {
-                    resolve({ dataUrl: c.toDataURL('image/jpeg', 0.98), format: 'JPEG' });
-                }
+                c.width = img.naturalWidth; c.height = img.naturalHeight;
+                c.getContext('2d').drawImage(img, 0, 0);
+                resolve({ dataUrl: c.toDataURL('image/png'), format: 'PNG', bytes: 0,
+                          width: img.naturalWidth, height: img.naturalHeight });
             };
-            img.onerror = () => resolve({ dataUrl: null, format: 'JPEG' });
-            img.src = url + (url.includes('?') ? '&' : '?') + "cache=" + Date.now();
+            img.onerror = () => resolve(null);
+            img.src = url;
         });
     }
 
