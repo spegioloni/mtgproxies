@@ -263,6 +263,13 @@
     // 5274 aber völlig in Ordnung. Wirklich unscharf sind erst Werte unter
     // ~2500 (Boseiju DE: 493, Ugin DE: 975); alles Scharfe lag bei 5139-5612.
     const SHARP_MIN = 2500;
+    // Obergrenze für die Variantensuche: mehr als 40 Drucke pro Sprache hat
+    // praktisch keine Karte, und ohne Deckel würde ein Ausreisser den Browser
+    // minutenlang Bilder decodieren lassen.
+    const MAX_VARIANTS = 40;
+    // Bilder unterliegen keinem Rate-Limit, aber zu viele gleichzeitige
+    // Decodes blockieren den Browser.
+    const MEASURE_BATCH = 6;
     const sharpCache = new Map();
 
     function measureSharpness(url) {
@@ -330,9 +337,16 @@
     //   Smothering Tithe neuester (wot) 931  -> bester (rna) 5541   6.0x
     //   Eternal Witness  neuester (m3c) 1123 -> bester (cmr) 5392   4.8x
     // So bleibt der deutsche Kartentext erhalten UND das Bild wird scharf.
-    // Sobald ein Druck über SHARP_MIN liegt, wird abgebrochen - das spart die
-    // meisten Messungen, weil oft schon der erste Alternativdruck genügt.
-    async function findSharperPrint(cards, lang, onProgress) {
+    //
+    // Die Variante (Artwork/Set) ist dabei kein hartes Kriterium, die Schärfe
+    // schon: es werden ALLE Drucke der Karte durchgegangen, bis einer über
+    // SHARP_MIN liegt. Frühere Fassungen prüften nur die 8 neuesten Drucke -
+    // bei Karten mit vielen alten Drucken (z.B. Counterspell, Llanowar Elves)
+    // steckt der scharfe Scan aber oft weiter hinten.
+    //
+    // `minGain` verhindert kosmetische Variantenwechsel: unterhalb von
+    // SHARP_MIN wird nur getauscht, wenn der Gewinn deutlich ist.
+    async function findSharperPrint(cards, lang, onProgress, minGain = 1.3) {
         if (!cards.length) return new Map();
 
         const byName = new Map();
@@ -359,31 +373,45 @@
         const todo = [];
         for (const c of cards) {
             if (todo.some(t => t.name === c.d.name)) continue;
-            const prints = (byName.get(c.d.name) || []).filter(p => p.id !== c.d.id).slice(0, 8);
+            // Alle Varianten als Kandidaten, scharf gescannte zuerst: so ist
+            // die Suche meist nach der ersten Messrunde fertig.
+            const prints = (byName.get(c.d.name) || [])
+                .filter(p => p.id !== c.d.id)
+                .sort((a, b) => (b.image_status === 'highres_scan') - (a.image_status === 'highres_scan'))
+                .slice(0, MAX_VARIANTS);
             if (prints.length) { todo.push({ name: c.d.name, base: c.score || 0, prints }); total += prints.length; }
         }
 
-        // Alle Kandidaten einer Karte parallel messen und das Maximum nehmen.
-        // Ein früher Abbruch beim ersten "gut genug" wäre falsch: für
-        // Smothering Tithe liegt der zweitbeste Druck bei 743, der beste bei
-        // 1754 - gemessen auf dem grossen Bild, das im PDF landet.
+        // Kandidaten in kleinen Runden messen und das Maximum nehmen. Ein
+        // Abbruch beim ersten *besseren* Druck wäre falsch: für Smothering
+        // Tithe liegt der zweitbeste Druck bei 743, der beste bei 1754.
+        // Abgebrochen wird erst, wenn ein Druck SHARP_MIN erreicht - dann ist
+        // die Karte scharf und weitere Varianten bringen nichts mehr.
         for (const t of todo) {
-            const scored = await Promise.all(t.prints.map(async p => {
-                const u = p.image_uris || (p.card_faces && p.card_faces[0].image_uris);
-                if (!u || !u.normal) return null;
-                return { p, v: await measureSharpness(u.normal) };
-            }));
-            checked += t.prints.length;
-            onProgress(`Prüfe Druckqualität ${checked}/${total}...`);
-
             let best = null, bestScore = t.base;
-            for (const s of scored) {
-                if (s && s.v != null && s.v > bestScore) { bestScore = s.v; best = s.p; }
+            for (let i = 0; i < t.prints.length; i += MEASURE_BATCH) {
+                const batch = t.prints.slice(i, i + MEASURE_BATCH);
+                const scored = await Promise.all(batch.map(async p => {
+                    const u = p.image_uris || (p.card_faces && p.card_faces[0].image_uris);
+                    if (!u || !u.normal) return null;
+                    return { p, v: await measureSharpness(u.normal) };
+                }));
+                checked += batch.length;
+                onProgress(`Prüfe Druckvarianten ${checked}/${total} (${t.name})...`);
+
+                for (const s of scored) {
+                    if (s && s.v != null && s.v > bestScore) { bestScore = s.v; best = s.p; }
+                }
+                if (bestScore >= SHARP_MIN) {
+                    total -= t.prints.length - (i + batch.length);   // Rest entfällt
+                    break;
+                }
             }
-            // Auch eine Verbesserung unterhalb der Schwelle mitnehmen, solange
-            // sie deutlich ist - besser ein spürbar schärferer deutscher Druck
-            // als gar keiner.
-            if (best && bestScore > t.base * 1.3) {
+
+            // Ein Druck über der Schwelle wird immer genommen - die Variante
+            // ist verhandelbar, die Schärfe nicht. Darunter nur bei deutlicher
+            // Verbesserung, sonst wechselt das Artwork ohne echten Gewinn.
+            if (best && (bestScore >= SHARP_MIN || bestScore > t.base * minGain)) {
                 better.set(t.name, { print: best, score: bestScore });
             }
         }
@@ -629,7 +657,6 @@
 
         // Auch für Englisch aufrufen: der Durchgang mit `is:highres` tauscht
         // unscharfe Standarddrucke gegen scharf gescannte.
-        const original = new Map(resolved);   // Ausgangsdrucke für den Vergleich merken
         const untranslated = await localizeBatch(resolved, currentLang, onProgress);
 
         // Bleibt eine Übersetzung unscharf, obwohl der englische Ausgangsdruck
@@ -649,12 +676,10 @@
 
         if (suspects.length) {
             onProgress(`Prüfe Bildschärfe von ${suspects.length} Karten...`);
-            // Begrenzte Parallelität: Bilder unterliegen keinem Rate-Limit,
-            // aber 100 gleichzeitige Decodes blockieren den Browser.
-            for (let i = 0; i < suspects.length; i += 6) {
-                const batch = suspects.slice(i, i + 6);
+            for (let i = 0; i < suspects.length; i += MEASURE_BATCH) {
+                const batch = suspects.slice(i, i + MEASURE_BATCH);
                 await Promise.all(batch.map(async s => { s.score = await measureSharpness(s.url); }));
-                onProgress(`Prüfe Bildschärfe ${Math.min(i + 6, suspects.length)}/${suspects.length}...`);
+                onProgress(`Prüfe Bildschärfe ${Math.min(i + MEASURE_BATCH, suspects.length)}/${suspects.length}...`);
             }
 
             for (const s of suspects) {
@@ -666,6 +691,7 @@
             // den übersetzten Kartentext und behebt trotzdem die Unschärfe.
             const better = await findSharperPrint(stillSoft, currentLang, onProgress);
 
+            const remaining = [];
             for (const s of stillSoft) {
                 const b = better.get(s.d.name);
                 if (b) {
@@ -673,19 +699,28 @@
                     upgraded.push(s.d.name);
                     if (b.score >= SHARP_MIN) continue;   // jetzt scharf genug
                     s.score = b.score;                    // sonst weiter als unscharf behandeln
+                    s.d = b.print;
                 }
+                remaining.push(s);
+            }
 
-                const o = original.get(s.content);
-                if (sharpFirst && o && o.lang !== s.d.lang) {
-                    const ou = o.image_uris || (o.card_faces && o.card_faces[0].image_uris);
-                    const ov = ou && ou.normal ? await measureSharpness(ou.normal) : null;
-                    if (ov != null && ov > s.score * 1.5) {
-                        resolved.set(s.content, o);
-                        swapped.push(s.d.name);
-                        const ui = upgraded.lastIndexOf(s.d.name);
-                        if (ui >= 0) upgraded.splice(ui, 1);
-                        continue;
-                    }
+            // Stufe 4: Sprache aufgeben. Auch hier werden ALLE englischen
+            // Varianten durchgemessen, nicht nur der ursprünglich gefundene
+            // Druck - der neueste englische Druck ist oft selbst unscharf.
+            // Der höhere Mindestgewinn stellt sicher, dass die Übersetzung nur
+            // für einen wirklich besseren Scan aufgegeben wird.
+            const enBetter = sharpFirst && remaining.length
+                ? await findSharperPrint(remaining.filter(s => s.d.lang !== 'en'), 'en', onProgress, 1.5)
+                : new Map();
+
+            for (const s of remaining) {
+                const e = enBetter.get(s.d.name);
+                if (e && s.d.lang !== 'en') {
+                    resolved.set(s.content, e.print);
+                    swapped.push(s.d.name);
+                    const ui = upgraded.lastIndexOf(s.d.name);
+                    if (ui >= 0) upgraded.splice(ui, 1);
+                    if (e.score >= SHARP_MIN) continue;
                 }
                 soft.push(s.d.name);
             }
@@ -719,7 +754,7 @@
         }
         if (upgraded.length) {
             const l = currentLang.toUpperCase();
-            notes.push(`Schärferen ${l}-Druck gefunden und verwendet (${[...new Set(upgraded)].length}): ` +
+            notes.push(`Schärfere ${l}-Variante gefunden und verwendet (${[...new Set(upgraded)].length}): ` +
                        `${[...new Set(upgraded)].join(', ')}`);
         }
         if (swapped.length) {
@@ -730,9 +765,9 @@
         const softNames = [...new Set(soft)];
         if (softNames.length) {
             notes.push(`Bester verfügbarer Scan ist trotzdem unscharf (${softNames.length}): ${softNames.join(', ')}. ` +
-                       (sharpFirst ? `Auch der englische Druck ist nicht schärfer. `
-                                   : `Option "Schärfe vor Sprache" aktivieren, um das englische Bild zu nutzen. `) +
-                       `Alternativ über "Variante wählen" einen anderen Druck aussuchen.`);
+                       `Alle Varianten wurden gemessen, keine ist scharf genug. ` +
+                       (sharpFirst ? `Auch die englischen Drucke sind nicht schärfer.`
+                                   : `Option "Schärfe vor Sprache" aktivieren, um auch englische Varianten zuzulassen.`));
         }
         if (rateLimitHits) {
             notes.push(`Scryfall-Limit wurde ${rateLimitHits}x erreicht - bitte erneut laden, ` +
