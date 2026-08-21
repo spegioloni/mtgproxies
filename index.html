@@ -58,9 +58,14 @@
 
 <header>
     <h1>MTG PROXY WIZARD 🧙‍♂️</h1>
-    <button class="theme-toggle" onclick="toggleTheme()">
-        <span id="theme-icon">🌙</span> <span id="theme-text">Dark Mode</span>
-    </button>
+    <div style="display:flex; gap: 0.6rem;">
+        <button class="theme-toggle" onclick="toggleLang()">
+            <span id="lang-icon">🇬🇧</span> <span id="lang-text">English</span>
+        </button>
+        <button class="theme-toggle" onclick="toggleTheme()">
+            <span id="theme-icon">🌙</span> <span id="theme-text">Dark Mode</span>
+        </button>
+    </div>
 </header>
 
 <div class="controls-container">
@@ -96,6 +101,7 @@
     let cardData = [];
     let currentEditIndex = null;
     let preferredArts = JSON.parse(localStorage.getItem('mtg_preferred_arts') || '{}');
+    let currentLang = localStorage.getItem('mtg_lang') || 'en';
 
     // On Load: Deckliste wiederherstellen
     window.onload = () => {
@@ -103,7 +109,44 @@
         if (savedList) {
             document.getElementById('listInput').value = savedList;
         }
+        updateLangUI();
     };
+
+    function updateLangUI() {
+        const icon = document.getElementById('lang-icon');
+        const text = document.getElementById('lang-text');
+        if (currentLang === 'de') {
+            icon.innerText = '🇩🇪'; text.innerText = 'Deutsch';
+        } else {
+            icon.innerText = '🇬🇧'; text.innerText = 'English';
+        }
+    }
+
+    function toggleLang() {
+        currentLang = currentLang === 'de' ? 'en' : 'de';
+        localStorage.setItem('mtg_lang', currentLang);
+        updateLangUI();
+        if (cardData.length) loadCards();
+    }
+
+    // Versucht, eine Karte (per set/collector_number) in der gewünschten Sprache zu laden.
+    // Fällt bei fehlender Übersetzung auf die Originalkarte zurück.
+    // Sucht über ALLE Editionen der Karte (nicht nur den zuletzt gefundenen Druck),
+    // da nicht jeder Druck (z.B. Secret Lair/Sonderdrucke) in jeder Sprache existiert.
+    async function localize(data, lang) {
+        if (!data || data.lang === lang || !data.name) return data;
+        try {
+            const isToken = data.layout === 'token';
+            const q = `!"${data.name}" lang:${lang}${isToken ? ' is:token' : ''}`;
+            const res = await fetch(`https://api.scryfall.com/cards/search?q=${encodeURIComponent(q)}&order=released&dir=desc`);
+            if (res.ok) {
+                const j = await res.json();
+                const t = j.data && j.data[0];
+                if (t && (t.image_uris || t.card_faces)) return t;
+            }
+        } catch (e) { /* ignore, keep original */ }
+        return data; // keine Übersetzung gefunden -> Original behalten
+    }
 
     function toggleTheme() {
         const h = document.documentElement;
@@ -159,6 +202,7 @@
             } else {
                 data = await resolveInput(content);
             }
+            data = await localize(data, currentLang);
 
             if (data && (data.image_uris || data.card_faces)) {
                 const img = data.image_uris?.normal || data.card_faces[0].image_uris.normal;
@@ -215,10 +259,15 @@
         artGrid.innerHTML = "Lade Varianten...";
 
         try {
-            const q = card.isToken ? `!"${card.name}" is:token` : `!"${card.name}" unique:prints`;
+            const langFilter = ` lang:${currentLang}`;
+            const q = card.isToken ? `!"${card.name}" is:token${langFilter}` : `!"${card.name}" unique:prints${langFilter}`;
             const res = await fetch(`https://api.scryfall.com/cards/search?q=${encodeURIComponent(q)}`);
             const data = await res.json();
             artGrid.innerHTML = "";
+            if (!data.data || !data.data.length) {
+                artGrid.innerHTML = `Keine Varianten in dieser Sprache (${currentLang}) gefunden.`;
+                return;
+            }
             data.data.forEach(print => {
                 const imgUrl = print.image_uris?.normal || print.card_faces[0].image_uris.normal;
                 const container = document.createElement('div');
