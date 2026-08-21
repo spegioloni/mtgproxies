@@ -87,6 +87,10 @@
             <option value="jpeg95">Hohe Qualität (JPEG 95%, kleine Datei)</option>
             <option value="lossless">Maximale Qualität (verlustfrei, sehr groß)</option>
         </select>
+        <label style="display:flex; align-items:center; gap:0.5rem; font-size:0.75rem; color:var(--text-muted); cursor:pointer;">
+            <input type="checkbox" id="sharpFirst" checked style="cursor:pointer;">
+            Schärfe vor Sprache (englisches Bild, wenn Übersetzung unscharf)
+        </label>
         <button id="dlBtn" class="btn btn-accent" onclick="generatePDF()">PDF Generieren</button>
     </div>
 </div>
@@ -249,6 +253,143 @@
         return p;
     }
 
+    // Misst die tatsächliche Bildschärfe als Varianz des Laplace-Operators auf
+    // dem kleinen Vorschaubild (488x680, lädt schnell).
+    //
+    // Scryfalls `image_status` allein reicht dafür nicht: "Cavern of Souls" ist
+    // als `lowres` markiert, erreicht aber 5242 und ist damit exakt so scharf
+    // wie der englische Druck (5208) - ein Sprachwechsel wäre dort grundlos.
+    // Umgekehrt ist der englische "Ugin" ebenfalls als `lowres` markiert, mit
+    // 5274 aber völlig in Ordnung. Wirklich unscharf sind erst Werte unter
+    // ~2500 (Boseiju DE: 493, Ugin DE: 975); alles Scharfe lag bei 5139-5612.
+    const SHARP_MIN = 2500;
+    const sharpCache = new Map();
+
+    function measureSharpness(url) {
+        if (sharpCache.has(url)) return sharpCache.get(url);
+        const p = new Promise(resolve => {
+            const img = new Image();
+            img.crossOrigin = 'anonymous';
+            img.onload = () => {
+                try {
+                    const c = document.createElement('canvas');
+                    c.width = img.naturalWidth;
+                    c.height = img.naturalHeight;
+                    const ctx = c.getContext('2d', { willReadFrequently: true });
+                    ctx.drawImage(img, 0, 0);
+                    const { data, width: w, height: h } = ctx.getImageData(0, 0, c.width, c.height);
+                    const g = new Float64Array(w * h);
+                    for (let i = 0; i < w * h; i++) {
+                        g[i] = 0.299 * data[i * 4] + 0.587 * data[i * 4 + 1] + 0.114 * data[i * 4 + 2];
+                    }
+                    let s = 0, s2 = 0, n = 0;
+                    for (let y = 1; y < h - 1; y++) {
+                        for (let x = 1; x < w - 1; x++) {
+                            const i = y * w + x;
+                            const L = 4 * g[i] - g[i - 1] - g[i + 1] - g[i - w] - g[i + w];
+                            s += L; s2 += L * L; n++;
+                        }
+                    }
+                    resolve(s2 / n - (s / n) ** 2);
+                } catch { resolve(null); }   // z.B. wenn das Canvas "tainted" ist
+            };
+            img.onerror = () => resolve(null);
+            img.src = url;
+        });
+        sharpCache.set(url, p);
+        return p;
+    }
+
+    // Sammelt ALLE Drucke der genannten Karten (nicht nur den ersten Treffer),
+    // damit anschliessend der schärfste davon ausgewählt werden kann.
+    async function collectPrints(chunk, prefix, byName) {
+        const names = chunk.map(g => g.name.replace(/"/g, ''));
+        const q = `${prefix}${names.map(n => `!"${n}"`).join(' or ')})`;
+        let url = `https://api.scryfall.com/cards/search?q=${encodeURIComponent(q)}&order=released&dir=desc`;
+        let guard = 0;
+        while (url && guard++ < 25) {
+            const res = await scryfallFetch(url);
+            if (!res || !res.data) break;
+            for (const card of res.data) {
+                if (!names.includes(card.name)) continue;
+                const u = card.image_uris || (card.card_faces && card.card_faces[0].image_uris);
+                if (!u || !u.normal) continue;
+                if (!byName.has(card.name)) byName.set(card.name, []);
+                byName.get(card.name).push(card);
+            }
+            url = res.has_more ? res.next_page : null;
+        }
+    }
+
+    // Sucht für unscharfe Karten den schärfsten Druck DERSELBEN Sprache.
+    //
+    // Hintergrund: Für viele Karten existiert bei Scryfall kein einziger
+    // deutscher Druck mit `image_status: highres_scan` - trotzdem ist unter den
+    // vielen "lowres"-Drucken oft einer deutlich besser. Gemessen:
+    //   Llanowar Elves   neuester (j25) 485  -> bester (dom) 2867   5.9x
+    //   Smothering Tithe neuester (wot) 931  -> bester (rna) 5541   6.0x
+    //   Eternal Witness  neuester (m3c) 1123 -> bester (cmr) 5392   4.8x
+    // So bleibt der deutsche Kartentext erhalten UND das Bild wird scharf.
+    // Sobald ein Druck über SHARP_MIN liegt, wird abgebrochen - das spart die
+    // meisten Messungen, weil oft schon der erste Alternativdruck genügt.
+    async function findSharperPrint(cards, lang, onProgress) {
+        if (!cards.length) return new Map();
+
+        const byName = new Map();
+        const groups = cards.map(c => ({ name: c.d.name }));
+        const seen = new Set();
+        const list = groups.filter(g => !seen.has(g.name) && seen.add(g.name));
+        const prefix = `lang:${lang} unique:prints (`;
+
+        const MAX_QUERY = 950;
+        const chunks = [];
+        let cur = [], len = prefix.length + 1;
+        for (const g of list) {
+            const cost = g.name.length + 3 + (cur.length ? 4 : 0);
+            if (cur.length && len + cost > MAX_QUERY) { chunks.push(cur); cur = []; len = prefix.length + 1; }
+            cur.push(g); len += cost;
+        }
+        if (cur.length) chunks.push(cur);
+
+        onProgress(`Suche schärfere Drucke für ${list.length} Karten...`);
+        for (const chunk of chunks) await collectPrints(chunk, prefix, byName);
+
+        const better = new Map();   // Kartenname -> besserer Druck
+        let checked = 0, total = 0;
+        const todo = [];
+        for (const c of cards) {
+            if (todo.some(t => t.name === c.d.name)) continue;
+            const prints = (byName.get(c.d.name) || []).filter(p => p.id !== c.d.id).slice(0, 8);
+            if (prints.length) { todo.push({ name: c.d.name, base: c.score || 0, prints }); total += prints.length; }
+        }
+
+        // Alle Kandidaten einer Karte parallel messen und das Maximum nehmen.
+        // Ein früher Abbruch beim ersten "gut genug" wäre falsch: für
+        // Smothering Tithe liegt der zweitbeste Druck bei 743, der beste bei
+        // 1754 - gemessen auf dem grossen Bild, das im PDF landet.
+        for (const t of todo) {
+            const scored = await Promise.all(t.prints.map(async p => {
+                const u = p.image_uris || (p.card_faces && p.card_faces[0].image_uris);
+                if (!u || !u.normal) return null;
+                return { p, v: await measureSharpness(u.normal) };
+            }));
+            checked += t.prints.length;
+            onProgress(`Prüfe Druckqualität ${checked}/${total}...`);
+
+            let best = null, bestScore = t.base;
+            for (const s of scored) {
+                if (s && s.v != null && s.v > bestScore) { bestScore = s.v; best = s.p; }
+            }
+            // Auch eine Verbesserung unterhalb der Schwelle mitnehmen, solange
+            // sie deutlich ist - besser ein spürbar schärferer deutscher Druck
+            // als gar keiner.
+            if (best && bestScore > t.base * 1.3) {
+                better.set(t.name, { print: best, score: bestScore });
+            }
+        }
+        return better;
+    }
+
     function setLoadStatus(text) {
         const grid = document.getElementById('cardGrid');
         const p = grid.querySelector('.load-status');
@@ -259,7 +400,7 @@
     // Schlägt die Anfrage fehl (z.B. wegen eines unerwartet abgelehnten Queries),
     // wird der Block halbiert und erneut versucht - bis hinunter zur Einzelsuche.
     // So kostet ein Fehlschlag nur wenige Zusatzanfragen statt 50.
-    async function runQuery(chunk, prefix, found, lang) {
+    async function runQuery(chunk, prefix, found) {
         const names = chunk.map(g => g.name.replace(/"/g, ''));
         const q = `${prefix}${names.map(n => `!"${n}"`).join(' or ')})`;
         let url = `https://api.scryfall.com/cards/search?q=${encodeURIComponent(q)}&order=released&dir=desc`;
@@ -284,22 +425,63 @@
         // (Bei einem einzelnen Namen heisst es schlicht: keine Übersetzung.)
         if (!any && chunk.length > 1) {
             const mid = Math.ceil(chunk.length / 2);
-            await runQuery(chunk.slice(0, mid), prefix, found, lang);
-            await runQuery(chunk.slice(mid), prefix, found, lang);
+            await runQuery(chunk.slice(0, mid), prefix, found);
+            await runQuery(chunk.slice(mid), prefix, found);
         }
     }
 
-    // Übersetzt viele Karten mit möglichst wenigen Requests.
-    // Statt einer Suche pro Karte (was bei einem Commander-Deck ~100 Requests
-    // bedeutet und zwangsläufig ins Rate-Limit läuft) werden bis zu 50 Namen
-    // in einer einzigen ODER-Suche gebündelt:
-    //   lang:de (!"Sol Ring" or !"Cavern of Souls" or ...)
+    // Zerlegt eine Namensliste in Blöcke unter dem 1024-Zeichen-Limit und
+    // setzt pro Block eine gebündelte Suche ab.
+    async function runPass(list, prefix, found, onProgress, label) {
+        // Scryfall schneidet Suchanfragen hart bei 1024 Zeichen ab. Die
+        // abgeschnittene Query verliert ihre schliessende Klammer und wird
+        // mit "unclosed parentheses" (HTTP 400) abgelehnt. Nachgemessen:
+        // 1024 Zeichen funktionieren, 1025 nicht. Mit Sicherheitsmarge:
+        const MAX_QUERY = 950;
+
+        const chunks = [];
+        let cur = [], len = prefix.length + 1;
+        for (const g of list) {
+            const cost = g.name.length + 3 + (cur.length ? 4 : 0); // !"name" + " or "
+            if (cur.length && len + cost > MAX_QUERY) { chunks.push(cur); cur = []; len = prefix.length + 1; }
+            cur.push(g); len += cost;
+        }
+        if (cur.length) chunks.push(cur);
+
+        let done = 0;
+        for (const chunk of chunks) {
+            onProgress(`${label} ${done + 1}-${done + chunk.length} von ${list.length}...`);
+            done += chunk.length;
+            await runQuery(chunk, prefix, found);
+        }
+    }
+
+    // Wählt Drucke für die Zielsprache - und zwar qualitätsbewusst.
+    //
+    // Scryfall kennzeichnet die Scanqualität je Druck über `image_status`.
+    // Nachgemessen (Laplace-Varianz als Schärfemass, gleiche 745x1040 Pixel):
+    //   highres_scan -> Median 2704
+    //   lowres       -> Median 338   (Boseiju DE: 79 vs. Boseiju EN: 1358)
+    // Beide liefern dieselbe Pixelzahl, aber "lowres" ist ein hochskalierter
+    // Scan und im Druck sichtbar matschig. Eine Sortierung nur nach
+    // Erscheinungsdatum wählt daher regelmässig unscharfe Bilder aus.
+    //
+    // Deshalb zwei Durchgänge:
+    //   1. `is:highres` - nur scharf gescannte Drucke
+    //   2. für alles, was übrig bleibt: beliebiger Druck der Zielsprache
+    // Das kostet nur ~2 Requests mehr und wirkt auch für Englisch, wo es
+    // unscharfe Standarddrucke gegen scharfe tauscht.
+    //
     // Karten ohne Druck in der Zielsprache behalten das Original.
     // Rückgabe: Namen, für die es keine Übersetzung gibt.
     async function localizeBatch(resolved, lang, onProgress) {
         const byName = new Map();   // Kartenname -> Listeneinträge
         for (const [content, d] of resolved) {
-            if (!d || !d.name || d.lang === lang) continue;
+            if (!d || !d.name) continue;
+            // Vom Nutzer selbst gewählte Variante nie überschreiben
+            if (preferredArts[content]) continue;
+            // Bereits in Zielsprache UND scharf -> nichts zu verbessern
+            if (d.lang === lang && d.image_status === 'highres_scan') continue;
             const key = (d.layout === 'token' ? 'T:' : 'C:') + d.name;
             if (!byName.has(key)) byName.set(key, { name: d.name, isToken: d.layout === 'token', contents: [] });
             byName.get(key).contents.push(content);
@@ -307,42 +489,39 @@
         if (!byName.size) return [];
 
         const groups = [...byName.values()];
-        const found = new Map();    // Name -> übersetzte Karte
+        const found = new Map();    // Name -> bester gefundener Druck
 
         // Tokens getrennt behandeln, sonst kollidieren sie mit echten Karten
         for (const isToken of [false, true]) {
             const list = groups.filter(g => g.isToken === isToken);
             if (!list.length) continue;
+            const base = `lang:${lang}${isToken ? ' is:token' : ''}`;
 
-            const prefix = `lang:${lang}${isToken ? ' is:token' : ''} (`;
-            // Scryfall schneidet Suchanfragen hart bei 1024 Zeichen ab. Die
-            // abgeschnittene Query verliert ihre schliessende Klammer und wird
-            // mit "unclosed parentheses" (HTTP 400) abgelehnt. Nachgemessen:
-            // 1024 Zeichen funktionieren, 1025 nicht. Mit Sicherheitsmarge:
-            const MAX_QUERY = 950;
+            // Durchgang 1: ausschliesslich scharfe Scans
+            await runPass(list, `${base} is:highres (`, found, onProgress, 'Suche scharfe Drucke');
 
-            const chunks = [];
-            let cur = [], len = prefix.length + 1;
-            for (const g of list) {
-                const cost = g.name.length + 3 + (cur.length ? 4 : 0); // !"name" + " or "
-                if (cur.length && len + cost > MAX_QUERY) { chunks.push(cur); cur = []; len = prefix.length + 1; }
-                cur.push(g); len += cost;
-            }
-            if (cur.length) chunks.push(cur);
-
-            let done = 0;
-            for (const chunk of chunks) {
-                onProgress(`Übersetze Karten ${done + 1}-${done + chunk.length} von ${list.length}...`);
-                done += chunk.length;
-                await runQuery(chunk, prefix, found, lang);
+            // Durchgang 2: Rest ohne Schärfefilter (besser übersetzt als gar nicht)
+            const rest = list.filter(g => !found.has(g.name));
+            if (rest.length) {
+                await runPass(rest, `${base} (`, found, onProgress, 'Suche weitere Drucke');
             }
         }
 
         const untranslated = [];
         for (const g of groups) {
             const loc = found.get(g.name);
-            if (loc) g.contents.forEach(c => resolved.set(c, loc));
-            else untranslated.push(g.name);
+            // Nur übernehmen, wenn es die Karte nicht verschlechtert: ein
+            // unscharfer Treffer darf einen bereits scharfen Druck nicht ersetzen.
+            if (loc) {
+                for (const c of g.contents) {
+                    const old = resolved.get(c);
+                    const downgrade = old && old.image_status === 'highres_scan' &&
+                                      loc.image_status !== 'highres_scan' && old.lang === loc.lang;
+                    if (!downgrade) resolved.set(c, loc);
+                }
+            } else if (!g.contents.some(c => { const d = resolved.get(c); return d && d.lang === lang; })) {
+                untranslated.push(g.name);
+            }
         }
         return untranslated;
     }
@@ -448,10 +627,68 @@
             return;
         }
 
-        // Übersetzung nur nötig, wenn nicht Englisch (Scryfall liefert per Default en)
-        let untranslated = [];
-        if (currentLang !== 'en') {
-            untranslated = await localizeBatch(resolved, currentLang, onProgress);
+        // Auch für Englisch aufrufen: der Durchgang mit `is:highres` tauscht
+        // unscharfe Standarddrucke gegen scharf gescannte.
+        const original = new Map(resolved);   // Ausgangsdrucke für den Vergleich merken
+        const untranslated = await localizeBatch(resolved, currentLang, onProgress);
+
+        // Bleibt eine Übersetzung unscharf, obwohl der englische Ausgangsdruck
+        // scharf ist, darf der Nutzer Druckqualität über die Sprache stellen.
+        // Entschieden wird per Messung, nicht per `image_status` (siehe unten).
+        const swapped = [], soft = [], upgraded = [], stillSoft = [];
+        const sharpFirst = document.getElementById('sharpFirst').checked;
+
+        // Nur verdächtige Karten messen - `highres_scan` ist verlässlich scharf.
+        const suspects = [];
+        for (const [content, d] of resolved) {
+            if (!d || d.image_status === 'highres_scan') continue;
+            if (preferredArts[content]) continue;   // selbst gewählte Variante respektieren
+            const u = d.image_uris || (d.card_faces && d.card_faces[0].image_uris);
+            if (u && u.normal) suspects.push({ content, d, url: u.normal });
+        }
+
+        if (suspects.length) {
+            onProgress(`Prüfe Bildschärfe von ${suspects.length} Karten...`);
+            // Begrenzte Parallelität: Bilder unterliegen keinem Rate-Limit,
+            // aber 100 gleichzeitige Decodes blockieren den Browser.
+            for (let i = 0; i < suspects.length; i += 6) {
+                const batch = suspects.slice(i, i + 6);
+                await Promise.all(batch.map(async s => { s.score = await measureSharpness(s.url); }));
+                onProgress(`Prüfe Bildschärfe ${Math.min(i + 6, suspects.length)}/${suspects.length}...`);
+            }
+
+            for (const s of suspects) {
+                if (s.score == null || s.score >= SHARP_MIN) continue;   // doch scharf genug
+                stillSoft.push(s);
+            }
+
+            // Stufe 3: schärferen Druck in derselben Sprache suchen. Das erhält
+            // den übersetzten Kartentext und behebt trotzdem die Unschärfe.
+            const better = await findSharperPrint(stillSoft, currentLang, onProgress);
+
+            for (const s of stillSoft) {
+                const b = better.get(s.d.name);
+                if (b) {
+                    resolved.set(s.content, b.print);
+                    upgraded.push(s.d.name);
+                    if (b.score >= SHARP_MIN) continue;   // jetzt scharf genug
+                    s.score = b.score;                    // sonst weiter als unscharf behandeln
+                }
+
+                const o = original.get(s.content);
+                if (sharpFirst && o && o.lang !== s.d.lang) {
+                    const ou = o.image_uris || (o.card_faces && o.card_faces[0].image_uris);
+                    const ov = ou && ou.normal ? await measureSharpness(ou.normal) : null;
+                    if (ov != null && ov > s.score * 1.5) {
+                        resolved.set(s.content, o);
+                        swapped.push(s.d.name);
+                        const ui = upgraded.lastIndexOf(s.d.name);
+                        if (ui >= 0) upgraded.splice(ui, 1);
+                        continue;
+                    }
+                }
+                soft.push(s.d.name);
+            }
         }
 
         const failed = [];
@@ -466,6 +703,7 @@
                     originalSearchName: content,
                     image: uris.normal,
                     highResImage: uris.png || uris.large || uris.normal,
+                    imageStatus: data.image_status,
                     isToken: data.layout === 'token'
                 });
             }
@@ -478,6 +716,23 @@
         if (untranslated.length) {
             const l = currentLang.toUpperCase();
             notes.push(`Kein ${l}-Druck vorhanden (bleibt englisch): ${untranslated.join(', ')}`);
+        }
+        if (upgraded.length) {
+            const l = currentLang.toUpperCase();
+            notes.push(`Schärferen ${l}-Druck gefunden und verwendet (${[...new Set(upgraded)].length}): ` +
+                       `${[...new Set(upgraded)].join(', ')}`);
+        }
+        if (swapped.length) {
+            notes.push(`Englisches Bild genutzt, weil der übersetzte Druck unscharf ist: ` +
+                       `${[...new Set(swapped)].join(', ')}`);
+        }        // Von Scryfall gibt es für diese Karten nur hochskalierte Scans - das ist
+        // die Obergrenze des Machbaren, kein Fehler des Tools.
+        const softNames = [...new Set(soft)];
+        if (softNames.length) {
+            notes.push(`Bester verfügbarer Scan ist trotzdem unscharf (${softNames.length}): ${softNames.join(', ')}. ` +
+                       (sharpFirst ? `Auch der englische Druck ist nicht schärfer. `
+                                   : `Option "Schärfe vor Sprache" aktivieren, um das englische Bild zu nutzen. `) +
+                       `Alternativ über "Variante wählen" einen anderen Druck aussuchen.`);
         }
         if (rateLimitHits) {
             notes.push(`Scryfall-Limit wurde ${rateLimitHits}x erreicht - bitte erneut laden, ` +
@@ -539,38 +794,50 @@
                 artGrid.innerHTML = `Keine Varianten in dieser Sprache (${currentLang}) gefunden.`;
                 return;
             }
+            // Scharfe Scans zuerst anzeigen - das ist die für den Druck relevante Reihenfolge
+            data.data.sort((a, b) => (b.image_status === 'highres_scan') - (a.image_status === 'highres_scan'));
             data.data.forEach(print => {
                 const uris = print.image_uris || print.card_faces[0].image_uris;
                 const imgUrl = uris.normal;
                 const hiResUrl = uris.png || uris.large || uris.normal;
+                const sharp = print.image_status === 'highres_scan';
                 const container = document.createElement('div');
                 container.className = 'art-option-container';
-                container.innerHTML = `<img src="${imgUrl}"><div class="apply-all-overlay">ALT+KLICK: Alle</div>`;
+                container.title = sharp ? 'Scharfer Scan - für den Druck geeignet'
+                                        : 'Nur hochskalierter Scan - im Druck unscharf';
+                container.innerHTML = `<img src="${imgUrl}">` +
+                    `<div class="apply-all-overlay">ALT+KLICK: Alle</div>` +
+                    `<div style="position:absolute;top:4px;left:4px;padding:1px 5px;border-radius:4px;` +
+                    `font-size:0.6rem;font-weight:700;background:${sharp ? '#1a7f37' : '#b35309'};color:#fff;">` +
+                    `${sharp ? 'SCHARF' : 'UNSCHARF'}</div>`;
+                container.style.position = 'relative';
                 container.onclick = (e) => {
-                    if (e.altKey) applyToAll(card.name, imgUrl, hiResUrl, print.id, card.originalSearchName);
-                    else selectArt(imgUrl, hiResUrl, print.id, card.originalSearchName);
+                    if (e.altKey) applyToAll(card.name, imgUrl, hiResUrl, print.id, card.originalSearchName, print.image_status);
+                    else selectArt(imgUrl, hiResUrl, print.id, card.originalSearchName, print.image_status);
                 };
                 artGrid.appendChild(container);
             });
         } catch (e) { artGrid.innerHTML = "Fehler beim Laden."; }
     }
 
-    function selectArt(url, hiResUrl, id, originalName) {
+    function selectArt(url, hiResUrl, id, originalName, imageStatus) {
         cardData[currentEditIndex].image = url;
         cardData[currentEditIndex].highResImage = hiResUrl;
         cardData[currentEditIndex].id = id;
+        cardData[currentEditIndex].imageStatus = imageStatus;
         preferredArts[originalName] = id;
         localStorage.setItem('mtg_preferred_arts', JSON.stringify(preferredArts));
         document.getElementById(`main-img-${currentEditIndex}`).src = url;
         closeModal();
     }
 
-    function applyToAll(name, imageUrl, hiResUrl, id, originalName) {
+    function applyToAll(name, imageUrl, hiResUrl, id, originalName, imageStatus) {
         cardData.forEach(card => {
             if (card.name === name) {
                 card.image = imageUrl;
                 card.highResImage = hiResUrl;
                 card.id = id;
+                card.imageStatus = imageStatus;
             }
         });
         preferredArts[originalName] = id;
